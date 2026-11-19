@@ -11,6 +11,7 @@ import app.earshield.core.BlockingListener
 import app.earshield.core.BlockingPipeline
 import app.earshield.core.BlockingSettings
 import app.earshield.core.Enrollment
+import app.earshield.core.LiveSpeaker
 import app.earshield.core.SpeakerSegmenter
 import app.earshield.core.Vectors
 import app.earshield.core.VoiceDiscovery
@@ -48,6 +49,18 @@ class BlockEvent(
 
 enum class VoiceRole { BLOCK, ALLOW, ME, SKIP }
 
+/** One row of the live "Who's talking" panel: a saved person, or one unknown voice. */
+data class LiveRow(
+    val key: String,
+    val label: String,
+    val role: LiveSpeaker.Role,
+    val talkingNow: Boolean,
+    val covered: Boolean,
+    val score: Float,
+    /** For unknown voices: the voice being followed, so it can be saved. */
+    val trackId: Int?,
+)
+
 /** A person found in a recorded conversation, waiting for you to label them. */
 class DiscoveredVoice(
     val number: Int,
@@ -79,6 +92,8 @@ data class LiveStatus(
     val captureSeconds: Float? = null,
     /** 0–1 while finding voices in a recording, or null. */
     val discoveryProgress: Float? = null,
+    /** Live speaker identification. */
+    val liveSpeakers: List<LiveRow> = emptyList(),
     /** Mic level in dBFS and speech probability, updated about 8 times a second. */
     val micDb: Float = -120f,
     val speechProbability: Float = 0f,
@@ -172,7 +187,7 @@ class ShieldController(private val context: Context) : BlockingListener {
         cancelCapture()
         _status.update {
             it.copy(running = false, starting = false, speaking = false, blockingName = null,
-                micDb = -120f, speechProbability = 0f, micSilent = false, outputMuted = false)
+                micDb = -120f, speechProbability = 0f, micSilent = false, outputMuted = false, liveSpeakers = emptyList())
         }
     }
 
@@ -226,6 +241,47 @@ class ShieldController(private val context: Context) : BlockingListener {
         val event = BlockEvent(nextEventId++, voice.name, System.currentTimeMillis(), leakedSeconds, score, heard)
         _status.update { it.copy(blockingName = voice.name, recentBlocks = (listOf(event) + it.recentBlocks).take(20)) }
         if (settingsStore.settings.value.buzzOnBlock && !paused.value) buzz()
+    }
+
+    /** Stable letters for unknown voices ("Unknown voice A", "B", …), by the track that follows them. */
+    private val unknownLabels = HashMap<Int, String>()
+    private val liveEmbeddings = HashMap<Int, FloatArray>()
+
+    override fun onSpeakers(speakers: List<LiveSpeaker>) {
+        synchronized(liveEmbeddings) {
+            liveEmbeddings.clear()
+            for (sp in speakers) liveEmbeddings[sp.trackId] = sp.embedding
+        }
+        val rows = ArrayList<LiveRow>()
+        // Saved people: one row each, even if they're followed as more than one voice.
+        for ((voice, group) in speakers.filter { it.voice != null }.groupBy { it.voice!!.id }) {
+            val first = group.first()
+            rows += LiveRow(
+                key = voice, label = first.voice!!.name, role = first.role,
+                talkingNow = group.any { it.talkingNow }, covered = group.any { it.covered },
+                score = group.maxOf { it.score }, trackId = null,
+            )
+        }
+        for (sp in speakers.filter { it.voice == null }) {
+            val letter = synchronized(unknownLabels) {
+                unknownLabels.getOrPut(sp.trackId) {
+                    val n = unknownLabels.size
+                    if (n < 26) ('A' + n).toString() else (n + 1).toString()
+                }
+            }
+            rows += LiveRow(
+                key = "track-${sp.trackId}", label = "Unknown voice $letter", role = sp.role,
+                talkingNow = sp.talkingNow, covered = sp.covered, score = sp.score, trackId = sp.trackId,
+            )
+        }
+        rows.sortWith(compareByDescending<LiveRow> { it.talkingNow }.thenBy { it.label })
+        _status.update { it.copy(liveSpeakers = rows) }
+    }
+
+    /** Saves a voice heard live (from everything they've said so far) as blocked or allowed. */
+    fun saveLiveVoice(trackId: Int, name: String, allowed: Boolean) {
+        val e = synchronized(liveEmbeddings) { liveEmbeddings[trackId]?.copyOf() } ?: return
+        voiceStore.add(name.trim().ifEmpty { if (allowed) "Allowed voice" else "Blocked voice" }, e, allowed)
     }
 
     override fun onFellBehind() {

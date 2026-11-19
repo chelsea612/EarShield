@@ -37,6 +37,26 @@ data class BlockingSettings(
     }
 }
 
+/** Someone the app is hearing, for the live "Who's talking" view. */
+class LiveSpeaker(
+    /** Stable for as long as the app keeps following this voice. */
+    val trackId: Int,
+    /** The voiceprint built from everything they've said so far (can be saved as a new voice). */
+    val embedding: FloatArray,
+    /** The saved voice they match, or null if they're not recognized. */
+    val voice: VoiceProfile?,
+    val score: Float,
+    val role: Role,
+    /** Talking in the last second or so (of live audio, which is ahead of what you hear). */
+    val talkingNow: Boolean,
+    /** Currently being covered. */
+    val covered: Boolean,
+    /** How many measurements the voiceprint is built from (more = more reliable). */
+    val evidence: Int,
+) {
+    enum class Role { BLOCKED, ALLOWED, UNKNOWN }
+}
+
 interface BlockingListener {
     fun onSpeechChanged(speaking: Boolean) {}
 
@@ -55,6 +75,9 @@ interface BlockingListener {
 
     /** The phone couldn't analyze audio before it had to be played, so some went out unchecked. */
     fun onFellBehind() {}
+
+    /** After each check (about once a second): everyone heard in the last little while, and who they are. */
+    fun onSpeakers(speakers: List<LiveSpeaker>) {}
 }
 
 /**
@@ -374,6 +397,38 @@ class BlockingPipeline(
             }
         }
         latestMatch?.let { listener?.onAnalysis(it, coveringNow.isNotEmpty()) }
+
+        // Live speaker list: everyone heard recently, matched against saved voices.
+        if (listener != null) {
+            val talking = HashSet<Track>()
+            val recentFrame = frames - (TALKING_NOW_SECONDS * frames * AudioFormat.SAMPLE_RATE / audio.size).toInt()
+            for (k in 0 until SpeakerSegmenter.SPEAKERS) {
+                val list = parts[k] ?: continue
+                for ((i, part) in list.withIndex()) {
+                    val until = if (i + 1 < list.size) list[i + 1].fromFrame else frames
+                    if ((part.fromFrame until until).any { act.active[k][it] }) part.track.lastSeen = end
+                    if ((max(part.fromFrame, recentFrame) until until).any { act.active[k][it] }) talking += part.track
+                }
+            }
+            val live = tracks.filter { end - it.lastSeen <= AudioFormat.samples(LIVE_LIST_SECONDS) && it.count > 0 }
+                .map { t ->
+                    val c = t.centroid
+                    val m = VoiceMatcher.best(c, voices)
+                    val blockedVoice = m.voice != null && m.score >= s.threshold && m.score - m.allowedScore >= ALLOWED_MARGIN
+                    val allowedVoice = !blockedVoice && m.allowedVoice != null && m.allowedScore >= s.threshold
+                    LiveSpeaker(
+                        trackId = t.id,
+                        embedding = c,
+                        voice = if (blockedVoice) m.voice else if (allowedVoice) m.allowedVoice else null,
+                        score = if (blockedVoice) m.score else if (allowedVoice) m.allowedScore else max(m.score, m.allowedScore),
+                        role = if (blockedVoice) LiveSpeaker.Role.BLOCKED else if (allowedVoice) LiveSpeaker.Role.ALLOWED else LiveSpeaker.Role.UNKNOWN,
+                        talkingNow = t in talking,
+                        covered = t.covering != null,
+                        evidence = t.count,
+                    )
+                }
+            listener.onSpeakers(live)
+        }
 
         fun partAt(k: Int, f: Int): Part? = parts[k]?.lastOrNull { it.fromFrame <= f }
 
@@ -752,6 +807,8 @@ class BlockingPipeline(
         /** Stands in for "someone who isn't on the allow list" in block events. */
         val STRANGER = VoiceProfile("stranger", "Someone not on your allow list", FloatArray(0))
         const val MIN_DELAY_SECONDS = 1f
+        const val TALKING_NOW_SECONDS = 1.5f
+        const val LIVE_LIST_SECONDS = 30f
         const val MAX_DELAY_SECONDS = 5f
         private val DEBUG = System.getProperty("earshield.debug") == "1"
         const val HOP_SECONDS = 1.0f

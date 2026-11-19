@@ -14,7 +14,13 @@ class VoiceProfile(
 )
 
 /** [voice] is the closest blocked voice; [allowedScore] is the similarity to the closest allowed voice. */
-data class VoiceMatch(val voice: VoiceProfile?, val score: Float, val allowedScore: Float = 0f)
+data class VoiceMatch(
+    val voice: VoiceProfile?,
+    val score: Float,
+    val allowedScore: Float = 0f,
+    /** The closest allowed voice (you, a friend, a "Not them" correction). */
+    val allowedVoice: VoiceProfile? = null,
+)
 
 object VoiceMatcher {
     /** The blocked voice most similar to [embedding] (cosine similarity, −1 to 1), plus the closest allowed score. */
@@ -22,16 +28,20 @@ object VoiceMatcher {
         var best: VoiceProfile? = null
         var bestScore = -1f
         var allowedScore = 0f
+        var allowedVoice: VoiceProfile? = null
         for (v in voices) {
             val s = Vectors.dot(embedding, v.embedding)
             if (v.allowed) {
-                allowedScore = maxOf(allowedScore, s)
+                if (s > allowedScore) {
+                    allowedScore = s
+                    allowedVoice = v
+                }
             } else if (s > bestScore) {
                 bestScore = s
                 best = v
             }
         }
-        return VoiceMatch(best, if (best == null) 0f else bestScore, allowedScore)
+        return VoiceMatch(best, if (best == null) 0f else bestScore, allowedScore, allowedVoice)
     }
 }
 

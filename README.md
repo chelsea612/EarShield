@@ -17,7 +17,8 @@ The APK is signed with a development key, so Play Protect may warn about an unkn
 2. **Learn voices from a conversation:** record 15–90 s of normal conversation. People can talk over each other. Earshield finds each person, lets you play a short clip of each through your earbuds, and you mark them **Block**, **Allow**, **Me** or **Skip**. Only the voiceprints you keep are saved; the recording is discarded.
 3. Tap any saved voice to **move** it between Blocked and Never blocked, **rename** it, **merge** it with another saved voice (when the same person was saved twice), or delete it. The **Block** / **Allow** button on each row moves it in one tap.
 4. Or add people one at a time: **Add one voice** (to block), **Allow one voice**, or **Teach it my voice**, each recorded while only that person talks.
-4. When a blocked voice is detected, it's covered (soft noise by default), and the phone buzzes once.
+4. **Who's talking** shows, live, everyone Earshield hears: their name if saved (blocked or allowed), or "Unknown voice A", "B"… with a **Save** button to block or allow them on the spot.
+5. When a blocked voice is detected, it's covered (soft noise by default), and the phone buzzes once.
 5. If someone is covered by mistake, tap **Not them** under *Recently covered*. That voice is then treated as allowed.
 
 | Setting | What it does |

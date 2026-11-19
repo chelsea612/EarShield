@@ -12,8 +12,8 @@ android {
         applicationId = "app.earshield"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.5.1"
+        versionCode = 11
+        versionName = "0.6.0"
         // Phones only; leaving out x86 emulator libraries keeps the APK much smaller.
         // 64-bit phones only: keeps the APK small. (Practically every phone since about 2017.)
         ndk { abiFilters += listOf("arm64-v8a") }

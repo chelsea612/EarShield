@@ -92,4 +92,38 @@ class DiscoveryTest {
         assertTrue(friendKept > 0.9, "allowed friend was covered")
         assertTrue(strangerKept < 0.1, "stranger was heard")
     }
+
+    /** Live identification: during each person's solo turn, they're listed as talking, with the right name. */
+    @Test
+    fun identifiesSpeakersLive() {
+        val audio = readWav(resource("three_people.wav"))
+        val refs = references("three_people.wav")
+        val ann = VoiceProfile("a", "Ann", refs["A"]!!, allowed = true)
+        val ben = VoiceProfile("b", "Ben", refs["B"]!!, allowed = false)
+        val seen = mutableListOf<Pair<Float, List<LiveSpeaker>>>()
+        var now = 0
+        val listener = object : BlockingListener {
+            override fun onSpeakers(speakers: List<LiveSpeaker>) { seen += now / 16000f to speakers }
+        }
+        val p = BlockingPipeline(encoder, segmenter, SileroVad(model("silero_vad.onnx")), listener, null, Executor { it.run() }, Random(1))
+        p.voices = listOf(ann, ben)
+        val out = FloatArray(AudioFormat.CHUNK)
+        for (c in 0 until audio.size / AudioFormat.CHUNK) {
+            now = (c + 1) * AudioFormat.CHUNK
+            p.process(audio.copyOfRange(c * AudioFormat.CHUNK, (c + 1) * AudioFormat.CHUNK), out)
+        }
+        // Solo turns (from the fixture plan): A 0–5, B 5–9, C 9–13, A 23–28 (C ends 22), B 28.5–33, C 33–37.
+        val turns = listOf(Triple("Ann", 2.5f, 5f), Triple("Ben", 7f, 9f), Triple(null, 11.5f, 13f),
+            Triple("Ann", 25f, 28f), Triple("Ben", 31f, 33f), Triple(null, 35.5f, 37f))
+        for ((name, from, to) in turns) {
+            val checks = seen.filter { it.first in from..to }
+            assertTrue(checks.isNotEmpty())
+            val right = checks.count { (_, list) ->
+                list.any { it.talkingNow && (if (name == null) it.role == LiveSpeaker.Role.UNKNOWN else it.voice?.name == name) }
+            }
+            val sample = checks.last().second.joinToString { "${it.voice?.name ?: "unknown#" + it.trackId}${if (it.talkingNow) "*" else ""}" }
+            println("    %.1f–%.1f s, expect %-7s: right in %d of %d checks (last: %s)".format(from, to, name ?: "unknown", right, checks.size, sample))
+            assertTrue(right * 2 >= checks.size, "live identification wrong for ${name ?: "unknown"} at $from–$to s")
+        }
+    }
 }

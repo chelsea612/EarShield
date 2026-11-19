@@ -71,6 +71,8 @@ import app.earshield.app.InputMode
 import app.earshield.app.LiveStatus
 import app.earshield.app.SaveOutcome
 import app.earshield.app.VoiceRole
+import app.earshield.app.LiveRow
+import app.earshield.core.LiveSpeaker
 import app.earshield.app.DiscoveredVoice
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -145,6 +147,7 @@ fun MainScreen(controller: ShieldController) {
                         "(Quick Settings) and that no call or other app is using the mic.") {}
                 }
             }
+            if (status.running) item { WhoIsTalkingCard(status, controller) }
             (status.error ?: permissionNote)?.let { msg ->
                 item { ErrorCard(msg) { controller.clearError(); permissionNote = null } }
             }
@@ -848,4 +851,75 @@ private fun FoundVoiceCard(
             }
         }
     }
+}
+
+/** Live speaker identification: who the app is hearing, and who they are. */
+@Composable
+private fun WhoIsTalkingCard(status: LiveStatus, controller: ShieldController) {
+    var saving by remember { mutableStateOf<LiveRow?>(null) }
+    SectionCard {
+        SectionTitle("Who's talking")
+        if (status.liveSpeakers.isEmpty()) {
+            Hint("No one yet. People appear here a second or two after they start talking.")
+        }
+        status.liveSpeakers.forEach { row ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val dot = when {
+                    row.covered && row.talkingNow -> TransPink
+                    row.talkingNow -> TransBlue
+                    else -> MaterialTheme.colorScheme.outline
+                }
+                Box(Modifier.size(10.dp).background(dot, CircleShape))
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(row.label, style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = if (row.talkingNow) FontWeight.SemiBold else FontWeight.Normal)
+                    Hint(buildString {
+                        append(when (row.role) {
+                            LiveSpeaker.Role.BLOCKED -> "Blocked"
+                            LiveSpeaker.Role.ALLOWED -> "Allowed"
+                            LiveSpeaker.Role.UNKNOWN -> "Not saved"
+                        })
+                        if (row.role != LiveSpeaker.Role.UNKNOWN) append(" · ${(row.score * 100).toInt()}% match")
+                        if (row.talkingNow) append(if (row.covered) " · talking, covered" else " · talking")
+                    })
+                }
+                if (row.trackId != null) {
+                    TextButton(onClick = { saving = row }) { Text("Save") }
+                }
+            }
+        }
+        Hint("Live audio is analyzed before you hear it, so names can appear a moment before the voice does.")
+    }
+    saving?.let { row -> SaveLiveVoiceDialog(row, controller) { saving = null } }
+}
+
+@Composable
+private fun SaveLiveVoiceDialog(row: LiveRow, controller: ShieldController, onDismiss: () -> Unit) {
+    var name by remember { mutableStateOf("") }
+    var allowed by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Save ${row.label}") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Hint("Uses everything this person has said so far. Save once they've talked for a few seconds.")
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    SegmentedButton(selected = !allowed, onClick = { allowed = false },
+                        shape = SegmentedButtonDefaults.itemShape(0, 2)) { Text("Block") }
+                    SegmentedButton(selected = allowed, onClick = { allowed = true },
+                        shape = SegmentedButtonDefaults.itemShape(1, 2)) { Text("Allow") }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                row.trackId?.let { controller.saveLiveVoice(it, name, allowed) }
+                onDismiss()
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
