@@ -1,0 +1,17 @@
+[
+ {
+  "who": "friend",
+  "start": 0,
+  "end": 128000
+ },
+ {
+  "who": "blocked",
+  "start": 64000,
+  "end": 160000
+ },
+ {
+  "who": "friend",
+  "start": 176000,
+  "end": 232048
+ }
+]

@@ -1,0 +1,47 @@
+[
+ {
+  "who": "friend",
+  "start": 0,
+  "end": 96000
+ },
+ {
+  "who": "gap",
+  "start": 96000,
+  "end": 108800
+ },
+ {
+  "who": "blocked",
+  "start": 108800,
+  "end": 204800
+ },
+ {
+  "who": "gap",
+  "start": 204800,
+  "end": 217600
+ },
+ {
+  "who": "friend",
+  "start": 217600,
+  "end": 313600
+ },
+ {
+  "who": "gap",
+  "start": 313600,
+  "end": 326400
+ },
+ {
+  "who": "blocked",
+  "start": 326400,
+  "end": 390400
+ },
+ {
+  "who": "gap",
+  "start": 390400,
+  "end": 403200
+ },
+ {
+  "who": "friend",
+  "start": 403200,
+  "end": 459248
+ }
+]

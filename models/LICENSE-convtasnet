@@ -1,0 +1,7 @@
+speech_separator.onnx is Conv-TasNet trained on Libri2Mix (sep_clean, 16 kHz) by Joris Cosentino
+with Asteroid (https://huggingface.co/JorisCos/ConvTasNet_Libri2Mix_sepclean_16k), exported to ONNX
+by https://huggingface.co/welcomyou/convtasnet-libri2mix-16k-onnx and quantized to 8-bit weights
+for Earshield.
+
+It is licensed under Creative Commons Attribution-ShareAlike 4.0 (CC BY-SA 4.0):
+https://creativecommons.org/licenses/by-sa/4.0/
