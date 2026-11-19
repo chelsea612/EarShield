@@ -1,6 +1,7 @@
 speaker_encoder.onnx is the WeSpeaker ResNet34-LM speaker embedding model
 (https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM), trained on VoxCeleb2 by the
-WeSpeaker project (https://github.com/wenet-e2e/wespeaker).
+WeSpeaker project (https://github.com/wenet-e2e/wespeaker). Earshield stores its weights as float16
+(tools/half_storage.py); it runs unchanged in float32.
 
 It is licensed under the Creative Commons Attribution 4.0 International license (CC BY 4.0):
 https://creativecommons.org/licenses/by/4.0/

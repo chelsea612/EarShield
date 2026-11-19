@@ -12,15 +12,19 @@ android {
         applicationId = "app.earshield"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.4.2"
+        versionCode = 8
+        versionName = "0.4.3"
         // Phones only; leaving out x86 emulator libraries keeps the APK much smaller.
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+        // 64-bit phones only: keeps the APK small. (Practically every phone since about 2017.)
+        ndk { abiFilters += listOf("arm64-v8a") }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Shrink the app's code. ONNX Runtime is kept whole: its native code calls into it by name.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Signed with the debug key so the release build can be sideloaded for testing.
             signingConfig = signingConfigs.getByName("debug")
         }
@@ -35,7 +39,9 @@ android {
 
     // The voice encoder and VAD models live in ../models and are bundled as assets.
     sourceSets["main"].assets.srcDir(rootProject.file("models"))
-    androidResources { noCompress += "onnx" }
+    // Compress the models and native libraries inside the APK to keep the download small.
+    // (Models are read fully into memory anyway; libraries are unpacked once at install.)
+    packaging { jniLibs { useLegacyPackaging = true } }
 }
 
 kotlin {
