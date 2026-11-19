@@ -6,7 +6,7 @@ Everything runs on the phone. Only voiceprints are saved (256 numbers per person
 
 ## Install
 
-1. Download [`Earshield-0.4.1.apk`](Earshield-0.4.1.apk) on your Android phone and open it. Android will ask you to allow installs from that app (Files, Chrome, etc.).
+1. On your Android phone, open the [latest release](https://github.com/chelsea612/EarShield/releases/latest) and download the `.apk` file, then open it. Android will ask you to allow installs from that app (Files, Chrome, etc.).
 2. Open Earshield, tap **Start listening**, and allow microphone and notification access.
 
 The APK is signed with a development key, so Play Protect may warn about an unknown developer. That's expected for a sideloaded test build.

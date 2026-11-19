@@ -45,6 +45,8 @@ class AudioEngine(
     private val onSilentMic: (Boolean) -> Unit = {},
     /** Called with false when output was silenced because it isn't going to earbuds/headphones. */
     private val onPrivateOutput: (Boolean) -> Unit = {},
+    /** About once a second: where sound is going, and how many playback gaps (underruns) so far. */
+    private val onOutputInfo: (route: String, gaps: Int) -> Unit = { _, _ -> },
 ) {
     /** True only while output is confirmed to be going to earbuds or headphones. */
     @Volatile private var outputPrivate = false
@@ -136,6 +138,7 @@ class AudioEngine(
                 for (i in 0 until n) inF[i] = pcmIn[i] / 32768f
                 pipeline.process(inF, outF)
                 if (++chunkCount % 8 == 0) checkRoute(track) // re-check about every 250 ms as a backstop
+                if (chunkCount % 32 == 0) onOutputInfo(lastRoute, track.underrunCount)
                 val private = outputPrivate
                 if (private && needsRestart) {
                     needsRestart = false
@@ -168,12 +171,30 @@ class AudioEngine(
         }
     }
 
-    /** Allows output only if the track is confirmed to be playing to earbuds or headphones. */
+    /**
+     * Allows output only once the track is confirmed to be playing to earbuds or headphones, and
+     * silences it the moment it is confirmed to be going anywhere else. Android sometimes briefly
+     * can't say where a track is routed; that keeps the current state instead of cutting the sound.
+     */
     private fun checkRoute(track: AudioTrack) {
         val device = track.routedDevice
-        val ok = device != null && device.type in PRIVATE_OUTPUTS &&
-            SystemClock.elapsedRealtime() >= distrustUntil
+        lastRoute = device?.let { describe(it.type) } ?: "unknown"
+        if (device == null) return
+        val ok = device.type in PRIVATE_OUTPUTS && SystemClock.elapsedRealtime() >= distrustUntil
         if (!ok && outputPrivate) silenceNow() else outputPrivate = ok
+    }
+
+    @Volatile private var lastRoute = "unknown"
+
+    private fun describe(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth (call mode)"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired headphones"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB headphones"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Phone speaker (blocked)"
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "Phone earpiece (blocked)"
+        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && type == AudioDeviceInfo.TYPE_BLE_HEADSET) "Bluetooth LE"
+        else if (type in PRIVATE_OUTPUTS) "Headphones" else "Other output (blocked)"
     }
 
     /** Switches Bluetooth to headset mode and returns the earbud mic device. */
@@ -267,10 +288,14 @@ class AudioEngine(
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .build()
-        val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        val preferred = if (headset != null) outputs.firstOrNull { it.type == headset.type }
-        else outputs.firstOrNull { it.type in PRIVATE_OUTPUTS }
-        preferred?.let { track.setPreferredDevice(it) }
+        // Earbud mic mode: play to the call-mode side of the same earbuds. Phone mic mode: let Android
+        // route media normally. (Steering it ourselves could pick the earbuds' call-mode output,
+        // which isn't open in this mode and made sound drop in and out.)
+        if (headset != null) {
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                .firstOrNull { it.type == headset.type }
+                ?.let { track.setPreferredDevice(it) }
+        }
         return track
     }
 

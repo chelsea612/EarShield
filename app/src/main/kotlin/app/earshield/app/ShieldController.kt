@@ -71,6 +71,9 @@ data class LiveStatus(
     val fellBehindAtMillis: Long = 0L,
     /** Output silenced because no earbuds/headphones are connected. */
     val outputMuted: Boolean = false,
+    /** Diagnostics: where sound is going, and playback gaps since starting. */
+    val outputRoute: String = "",
+    val playbackGaps: Int = 0,
 )
 
 /** App-wide owner of the models, the pipeline and the audio engine. */
@@ -169,7 +172,8 @@ class ShieldController(private val context: Context) : BlockingListener {
         engine?.stop()
         engine = AudioEngine(context, p, mode, onError = { msg -> fail(msg) },
             onSilentMic = { silent -> _status.update { it.copy(micSilent = silent) } },
-            onPrivateOutput = { ok -> _status.update { it.copy(outputMuted = !ok) } }).also { it.start() }
+            onPrivateOutput = { ok -> _status.update { it.copy(outputMuted = !ok) } },
+            onOutputInfo = { route, gaps -> _status.update { it.copy(outputRoute = route, playbackGaps = gaps) } }).also { it.start() }
         engineMode = mode
     }
 

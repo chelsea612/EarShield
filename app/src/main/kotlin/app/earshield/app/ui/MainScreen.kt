@@ -229,6 +229,9 @@ private fun StatusCard(
                     style = MaterialTheme.typography.bodySmall)
             }
             MicMeter(status)
+            if (status.outputRoute.isNotEmpty()) {
+                Hint("Sound to: ${status.outputRoute} · playback gaps: ${status.playbackGaps}")
+            }
             val name = status.closestName
             if (status.speaking && name != null) {
                 Text("Closest blocked voice: $name (${(status.closestScore * 100).roundToInt()}% match, blocks at ${(settings.threshold * 100).roundToInt()}%)",
