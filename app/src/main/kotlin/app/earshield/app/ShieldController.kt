@@ -316,6 +316,9 @@ class ShieldController(private val context: Context) : BlockingListener {
     }
 
     fun removeVoice(id: String) = voiceStore.remove(id)
+    fun updateVoice(id: String, name: String, allowed: Boolean) = voiceStore.update(id, name, allowed)
+    fun mergeVoices(keepId: String, otherId: String, name: String, allowed: Boolean) =
+        voiceStore.merge(keepId, otherId, name, allowed)
 
     // --- Learning voices from a conversation -------------------------------------------------------
 

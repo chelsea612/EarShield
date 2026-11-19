@@ -4,6 +4,7 @@ import android.content.Context
 import app.earshield.core.BlockingSettings
 import app.earshield.core.CoverStyle
 import app.earshield.core.OverlapStyle
+import app.earshield.core.Vectors
 import app.earshield.core.VoiceProfile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -110,6 +111,30 @@ class VoiceStore(context: Context) {
 
     @Synchronized
     fun remove(id: String) = save(_voices.value.filterNot { it.id == id })
+
+    /** Renames a voice and/or moves it between Blocked and Never blocked. */
+    @Synchronized
+    fun update(id: String, name: String, allowed: Boolean) = save(_voices.value.map { v ->
+        if (v.id == id) VoiceProfile(v.id, name.trim().ifEmpty { v.name }, v.embedding, v.createdAtMillis, allowed) else v
+    })
+
+    /**
+     * Combines two saved voices of the same person into one: the voiceprints are averaged, and the
+     * result keeps [keepId]'s place, with the given name and list.
+     */
+    @Synchronized
+    fun merge(keepId: String, otherId: String, name: String, allowed: Boolean) {
+        val keep = _voices.value.firstOrNull { it.id == keepId } ?: return
+        val other = _voices.value.firstOrNull { it.id == otherId } ?: return
+        val combined = Vectors.normalized(Vectors.mean(listOf(keep.embedding, other.embedding)))
+        save(_voices.value.mapNotNull { v ->
+            when (v.id) {
+                keepId -> VoiceProfile(v.id, name.trim().ifEmpty { v.name }, combined, minOf(keep.createdAtMillis, other.createdAtMillis), allowed)
+                otherId -> null
+                else -> v
+            }
+        })
+    }
 
     private fun save(list: List<VoiceProfile>) {
         val arr = JSONArray()

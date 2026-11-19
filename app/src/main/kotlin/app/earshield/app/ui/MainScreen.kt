@@ -24,6 +24,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.foundation.clickable
+import app.earshield.core.Vectors
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
@@ -152,7 +155,7 @@ fun MainScreen(controller: ShieldController) {
                 }
             }
             item {
-                VoicesCard(voices, onAdd = { addMode = when (it) { false -> VoiceRole.BLOCK; true -> VoiceRole.ME; null -> VoiceRole.ALLOW } }, onLearn = { learning = true }, onRemove = controller::removeVoice)
+                VoicesCard(voices, controller, onAdd = { addMode = when (it) { false -> VoiceRole.BLOCK; true -> VoiceRole.ME; null -> VoiceRole.ALLOW } }, onLearn = { learning = true })
             }
             item { MicCard(settings, status.running) { mode -> controller.settingsStore.update { it.copy(inputMode = mode) } } }
             item { BlockingCard(settings) { change -> controller.settingsStore.update(change) } }
@@ -307,25 +310,30 @@ private fun ErrorCard(message: String, onDismiss: () -> Unit) {
 @Composable
 private fun VoicesCard(
     voices: List<VoiceProfile>,
+    controller: ShieldController,
     onAdd: (allowed: Boolean?) -> Unit,
     onLearn: () -> Unit,
-    onRemove: (String) -> Unit,
 ) {
-    var confirm by remember { mutableStateOf<VoiceProfile?>(null) }
+    var editing by remember { mutableStateOf<VoiceProfile?>(null) }
     val blocked = voices.filterNot { it.allowed }
     val allowed = voices.filter { it.allowed }
     val dates = remember { DateFormat.getDateInstance(DateFormat.MEDIUM) }
 
     @Composable
     fun VoiceRow(v: VoiceProfile) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().clickable { editing = v }.padding(vertical = 4.dp),
+        ) {
             Column(Modifier.weight(1f)) {
                 Text(v.name, style = MaterialTheme.typography.bodyLarge)
-                Hint("Added ${dates.format(Date(v.createdAtMillis))}")
+                Hint("Added ${dates.format(Date(v.createdAtMillis))} · tap to move, rename or merge")
             }
-            IconButton(onClick = { confirm = v }) {
-                Icon(Icons.Filled.Delete, contentDescription = "Remove ${v.name}")
+            // One-tap move to the other list.
+            TextButton(onClick = { controller.updateVoice(v.id, v.name, !v.allowed) }) {
+                Text(if (v.allowed) "Block" else "Allow")
             }
+            Icon(Icons.Filled.Edit, contentDescription = "Edit ${v.name}", tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 
@@ -365,16 +373,97 @@ private fun VoicesCard(
             OutlinedButton(onClick = { onAdd(null) }) { Text("Allow one voice") }
         }
     }
-    confirm?.let { v ->
-        AlertDialog(
-            onDismissRequest = { confirm = null },
-            title = { Text(if (v.allowed) "Remove ${v.name}?" else "Stop blocking ${v.name}?") },
-            text = { Text("This voiceprint will be deleted from this phone.") },
-            confirmButton = { TextButton(onClick = { onRemove(v.id); confirm = null }) { Text("Remove") } },
-            dismissButton = { TextButton(onClick = { confirm = null }) { Text("Cancel") } },
-        )
-    }
+    editing?.let { v -> EditVoiceDialog(v, voices, controller, onDismiss = { editing = null }) }
 }
+
+/** Rename a voice, move it between lists, merge it with another saved voice, or delete it. */
+@Composable
+private fun EditVoiceDialog(
+    voice: VoiceProfile,
+    voices: List<VoiceProfile>,
+    controller: ShieldController,
+    onDismiss: () -> Unit,
+) {
+    var name by remember { mutableStateOf(voice.name) }
+    var allowed by remember { mutableStateOf(voice.allowed) }
+    var mergeWith by remember { mutableStateOf<VoiceProfile?>(null) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    val others = voices.filter { it.id != voice.id }
+
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete ${voice.name}?") },
+            text = { Text("This voiceprint will be deleted from this phone.") },
+            confirmButton = { TextButton(onClick = { controller.removeVoice(voice.id); onDismiss() }) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Edit voice") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+
+                Text("List", style = MaterialTheme.typography.bodyMedium)
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    SegmentedButton(selected = !allowed, onClick = { allowed = false },
+                        shape = SegmentedButtonDefaults.itemShape(0, 2)) { Text("Blocked") }
+                    SegmentedButton(selected = allowed, onClick = { allowed = true },
+                        shape = SegmentedButtonDefaults.itemShape(1, 2)) { Text("Never blocked") }
+                }
+
+                if (others.isNotEmpty()) {
+                    Text("Merge with another voice", style = MaterialTheme.typography.bodyMedium)
+                    Hint("If the same person was saved twice, combine them into one, more reliable voice.")
+                    others.forEach { o ->
+                        val sim = Vectors.dot(voice.embedding, o.embedding)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().clickable { mergeWith = if (mergeWith?.id == o.id) null else o },
+                        ) {
+                            androidx.compose.material3.RadioButton(selected = mergeWith?.id == o.id, onClick = {
+                                mergeWith = if (mergeWith?.id == o.id) null else o
+                            })
+                            Column(Modifier.weight(1f)) {
+                                Text(o.name)
+                                Hint((if (o.allowed) "Never blocked" else "Blocked") + " · ${(sim * 100).toInt()}% alike")
+                            }
+                        }
+                    }
+                    mergeWith?.let { o ->
+                        if (Vectors.dot(voice.embedding, o.embedding) < MERGE_WARN) {
+                            Text("These two sound like different people. Merging them could block or allow the wrong voices.",
+                                color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+
+                TextButton(onClick = { confirmDelete = true }) {
+                    Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Delete this voice", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val m = mergeWith
+                if (m != null) controller.mergeVoices(voice.id, m.id, name, allowed)
+                else controller.updateVoice(voice.id, name, allowed)
+                onDismiss()
+            }) { Text(if (mergeWith != null) "Merge and save" else "Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** Below this similarity, merging two voices probably combines two different people. */
+private const val MERGE_WARN = 0.40f
 
 @Composable
 private fun MicCard(settings: AppSettings, running: Boolean, onChange: (InputMode) -> Unit) {
