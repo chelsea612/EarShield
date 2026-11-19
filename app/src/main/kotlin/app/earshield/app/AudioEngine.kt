@@ -53,6 +53,14 @@ class AudioEngine(
     /** After an "unplugged" alert, don't trust the route again until this time (elapsed ms). */
     @Volatile private var distrustUntil = 0L
     @Volatile private var activeTrack: AudioTrack? = null
+    @Volatile private var preview: FloatArray? = null
+    @Volatile private var previewPos = 0
+
+    /** Plays [clip] to the earbuds over the (turned-down) room sound. Only ever to private output. */
+    fun playPreview(clip: FloatArray) {
+        previewPos = 0
+        preview = clip
+    }
     /** Set when queued audio was thrown away; playback restarts once output is private again. */
     @Volatile private var needsRestart = false
 
@@ -137,6 +145,12 @@ class AudioEngine(
                 }
                 for (i in 0 until n) inF[i] = pcmIn[i] / 32768f
                 pipeline.process(inF, outF)
+                preview?.let { pv ->
+                    val start = previewPos
+                    for (i in 0 until n) outF[i] = outF[i] * 0.15f + pv.getOrElse(start + i) { 0f }
+                    previewPos = start + n
+                    if (previewPos >= pv.size) preview = null
+                }
                 if (++chunkCount % 8 == 0) checkRoute(track) // re-check about every 250 ms as a backstop
                 if (chunkCount % 32 == 0) onOutputInfo(lastRoute, track.underrunCount)
                 val private = outputPrivate

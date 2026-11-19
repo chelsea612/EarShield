@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -66,6 +67,11 @@ import app.earshield.app.AppSettings
 import app.earshield.app.InputMode
 import app.earshield.app.LiveStatus
 import app.earshield.app.SaveOutcome
+import app.earshield.app.VoiceRole
+import app.earshield.app.DiscoveredVoice
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import app.earshield.core.VoiceDiscovery
 import app.earshield.app.ShieldController
 import app.earshield.core.CoverStyle
 import app.earshield.core.OverlapStyle
@@ -83,8 +89,9 @@ fun MainScreen(controller: ShieldController) {
     val settings by controller.settingsStore.settings.collectAsStateWithLifecycle()
     val voices by controller.voiceStore.voices.collectAsStateWithLifecycle()
     val context = LocalContext.current
-    // null = hidden; false = add a voice to block; true = teach an allowed voice (yours)
-    var addMode by remember { mutableStateOf<Boolean?>(null) }
+    // null = hidden; BLOCK = add a voice to block; ME = teach your voice; ALLOW = allow someone else
+    var addMode by remember { mutableStateOf<VoiceRole?>(null) }
+    var learning by remember { mutableStateOf(false) }
     var permissionNote by remember { mutableStateOf<String?>(null) }
     var droppedSeen by remember { mutableStateOf(false) }
 
@@ -145,7 +152,7 @@ fun MainScreen(controller: ShieldController) {
                 }
             }
             item {
-                VoicesCard(voices, onAdd = { addMode = it }, onRemove = controller::removeVoice)
+                VoicesCard(voices, onAdd = { addMode = when (it) { false -> VoiceRole.BLOCK; true -> VoiceRole.ME; null -> VoiceRole.ALLOW } }, onLearn = { learning = true }, onRemove = controller::removeVoice)
             }
             item { MicCard(settings, status.running) { mode -> controller.settingsStore.update { it.copy(inputMode = mode) } } }
             item { BlockingCard(settings) { change -> controller.settingsStore.update(change) } }
@@ -161,8 +168,11 @@ fun MainScreen(controller: ShieldController) {
         }
     }
 
-    addMode?.let { allowed ->
-        AddVoiceDialog(controller, status, allowed, onStartListening = ::startWithPermissions, onDismiss = { addMode = null })
+    if (learning) {
+        LearnVoicesDialog(controller, status, onStartListening = ::startWithPermissions, onDismiss = { learning = false })
+    }
+    addMode?.let { role ->
+        AddVoiceDialog(controller, status, role, onStartListening = ::startWithPermissions, onDismiss = { addMode = null })
     }
 }
 
@@ -295,7 +305,12 @@ private fun ErrorCard(message: String, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun VoicesCard(voices: List<VoiceProfile>, onAdd: (allowed: Boolean) -> Unit, onRemove: (String) -> Unit) {
+private fun VoicesCard(
+    voices: List<VoiceProfile>,
+    onAdd: (allowed: Boolean?) -> Unit,
+    onLearn: () -> Unit,
+    onRemove: (String) -> Unit,
+) {
     var confirm by remember { mutableStateOf<VoiceProfile?>(null) }
     val blocked = voices.filterNot { it.allowed }
     val allowed = voices.filter { it.allowed }
@@ -315,6 +330,13 @@ private fun VoicesCard(voices: List<VoiceProfile>, onAdd: (allowed: Boolean) -> 
     }
 
     SectionCard {
+        SectionTitle("Learn voices")
+        Hint("Record a normal conversation, even with people talking over each other. Earshield finds each " +
+            "person and lets you listen to them and choose who to block or allow.")
+        Button(onClick = onLearn) { Text("Learn voices from a conversation") }
+    }
+    Spacer(Modifier.height(12.dp))
+    SectionCard {
         SectionTitle("Blocked voices")
         if (blocked.isEmpty()) Hint("No one yet.")
         blocked.forEachIndexed { i, v ->
@@ -324,20 +346,23 @@ private fun VoicesCard(voices: List<VoiceProfile>, onAdd: (allowed: Boolean) -> 
         FilledTonalButton(onClick = { onAdd(false) }) {
             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
-            Text("Add a voice")
+            Text("Add one voice")
         }
     }
     Spacer(Modifier.height(12.dp))
     SectionCard {
         SectionTitle("Never blocked")
-        Hint("Your voice and anything you marked \"Not them\". A voice is only covered if it sounds clearly " +
+        Hint("You, friends, and anything you marked \"Not them\". A voice is only covered if it sounds clearly " +
             "more like a blocked person than like anything here.")
         allowed.forEachIndexed { i, v ->
             if (i > 0) HorizontalDivider()
             VoiceRow(v)
         }
-        if (allowed.none { it.name == "You" }) {
-            OutlinedButton(onClick = { onAdd(true) }) { Text("Teach it my voice") }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (allowed.none { it.name == "You" }) {
+                OutlinedButton(onClick = { onAdd(true) }) { Text("Teach it my voice") }
+            }
+            OutlinedButton(onClick = { onAdd(null) }) { Text("Allow one voice") }
         }
     }
     confirm?.let { v ->
@@ -436,6 +461,15 @@ private fun BlockingCard(settings: AppSettings, onChange: ((AppSettings) -> AppS
 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
+                Text("Block everyone I haven't allowed", style = MaterialTheme.typography.bodyMedium)
+                Hint(if (settings.blockStrangers) "Only you and your allowed voices are heard. Anyone else is covered."
+                    else "Off: only blocked voices are covered.")
+            }
+            Switch(checked = settings.blockStrangers, onCheckedChange = { b -> onChange { it.copy(blockStrangers = b) } })
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
                 Text("Buzz when blocking", style = MaterialTheme.typography.bodyMedium)
                 Hint("So you know something was said.")
             }
@@ -489,18 +523,20 @@ private fun RecentCard(status: LiveStatus, onNotThem: (Long) -> Unit) {
 private fun AddVoiceDialog(
     controller: ShieldController,
     status: LiveStatus,
-    allowed: Boolean,
+    role: VoiceRole,
     onStartListening: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var name by remember { mutableStateOf(if (allowed) "You" else "") }
+    val allowed = role != VoiceRole.BLOCK
+    val isMe = role == VoiceRole.ME
+    var name by remember { mutableStateOf(if (isMe) "You" else "") }
     var error by remember { mutableStateOf<String?>(null) }
     var mixed by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val recording = status.enrollingSeconds
     val target = 12f
-    val whose = if (allowed) "your" else "their"
+    val whose = if (isMe) "your" else "their"
 
     fun close() {
         controller.cancelEnrollment()
@@ -518,7 +554,7 @@ private fun AddVoiceDialog(
 
     AlertDialog(
         onDismissRequest = ::close,
-        title = { Text(if (allowed) "Teach it your voice" else "Add a voice to block") },
+        title = { Text(when (role) { VoiceRole.ME -> "Teach it your voice"; VoiceRole.ALLOW -> "Allow a voice"; else -> "Add a voice to block" }) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") }, singleLine = true,
@@ -528,7 +564,7 @@ private fun AddVoiceDialog(
                         Text("This recording sounds like more than one voice, or a lot of background noise. " +
                             "A voiceprint like that can end up matching everyone.",
                             style = MaterialTheme.typography.bodyMedium)
-                        Hint("Record again while only ${if (allowed) "you are" else "they are"} talking, or save it anyway.")
+                        Hint("Record again while only ${if (isMe) "you are" else "they are"} talking, or save it anyway.")
                     }
                     !status.running -> {
                         Hint("Earshield needs to be listening to learn a voice.")
@@ -541,7 +577,7 @@ private fun AddVoiceDialog(
                         LinearProgressIndicator(progress = { (recording / target).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
                         Hint(
                             if (recording < Enrollment.MIN_SECONDS) {
-                                if (allowed) "Keep talking normally. Read something aloud if it helps."
+                                if (isMe) "Keep talking normally. Read something aloud if it helps."
                                 else "Keep going while only they are talking."
                             } else "That's enough to work. Around ${target.toInt()} s is more reliable."
                         )
@@ -549,14 +585,14 @@ private fun AddVoiceDialog(
                     else -> {
                         MicMeter(status)
                         Hint(
-                            if (allowed) "Talk normally for about 12 seconds with no one else talking. " +
+                            if (isMe) "Talk normally for about 12 seconds with no one else talking. " +
                                 "Earshield will never cover your voice."
                             else "Record while only this person is talking. Other voices mixed in make blocking less accurate. " +
                                 "The bar turns pink when Earshield hears speech."
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { error = null; controller.startEnrollment() }) { Text("Record now") }
-                            if (!allowed) {
+                            if (!isMe) {
                                 OutlinedButton(onClick = {
                                     saving = true
                                     error = null
@@ -564,7 +600,7 @@ private fun AddVoiceDialog(
                                 }, enabled = !saving) { Text("Use last 10 s") }
                             }
                         }
-                        if (!allowed) {
+                        if (!isMe) {
                             Hint("\"Use last 10 s\" learns whoever spoke most recently. Only use it if they were the only one talking.")
                         }
                     }
@@ -592,4 +628,135 @@ private fun AddVoiceDialog(
             }
         },
     )
+}
+
+/** Record a conversation, find the people in it, listen to each, and choose block / allow / me / skip. */
+@Composable
+private fun LearnVoicesDialog(
+    controller: ShieldController,
+    status: LiveStatus,
+    onStartListening: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var results by remember { mutableStateOf<List<DiscoveredVoice>?>(null) }
+    val names = remember { mutableStateOf(mapOf<Int, String>()) }
+    val roles = remember { mutableStateOf(mapOf<Int, VoiceRole>()) }
+    val recording = status.captureSeconds
+    val analyzing = status.discoveryProgress
+
+    fun close() {
+        controller.cancelCapture()
+        onDismiss()
+    }
+
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Learn voices from a conversation") },
+        text = {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                val found = results
+                when {
+                    !status.running -> {
+                        Hint("Earshield needs to be listening to record.")
+                        Button(onClick = onStartListening, enabled = !status.starting) { Text("Start listening") }
+                    }
+                    analyzing != null -> {
+                        Text("Finding the voices…", style = MaterialTheme.typography.bodyMedium)
+                        LinearProgressIndicator(progress = { analyzing }, modifier = Modifier.fillMaxWidth())
+                    }
+                    found != null && found.isEmpty() -> {
+                        Text("No clear voices were found. Try recording a little longer, closer to the people talking.")
+                    }
+                    found != null -> {
+                        Hint("Listen to each voice and choose what to do. The recording is deleted when you close this.")
+                        found.forEach { v -> FoundVoiceCard(v, controller, names, roles) }
+                    }
+                    recording != null -> {
+                        MicMeter(status)
+                        val max = VoiceDiscovery.MAX_RECORDING_SECONDS
+                        Text("Recording: ${"%.0f".format(recording)} s", style = MaterialTheme.typography.bodyMedium)
+                        LinearProgressIndicator(progress = { recording / max }, modifier = Modifier.fillMaxWidth())
+                        Hint(
+                            if (recording < VoiceDiscovery.MIN_RECORDING_SECONDS) "Keep going: at least ${VoiceDiscovery.MIN_RECORDING_SECONDS.toInt()} s."
+                            else if (recording >= max) "That's the most it can record. Tap \"Find voices\"."
+                            else "Each person should say a few sentences. Up to ${max.toInt()} s."
+                        )
+                    }
+                    else -> {
+                        MicMeter(status)
+                        Hint("Record 30–90 s of normal conversation. People can talk over each other. Each person " +
+                            "should say a few sentences. Nothing is saved except the voiceprints you choose to keep.")
+                        Button(onClick = { controller.startCapture() }) { Text("Start recording") }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            val found = results
+            when {
+                recording != null -> TextButton(
+                    enabled = recording >= VoiceDiscovery.MIN_RECORDING_SECONDS,
+                    onClick = { scope.launch { results = controller.findVoices() } },
+                ) { Text("Find voices") }
+                found != null && found.isNotEmpty() -> TextButton(onClick = {
+                    controller.saveDiscovered(found.map { v ->
+                        Triple(v, names.value[v.number] ?: "", roles.value[v.number] ?: VoiceRole.SKIP)
+                    })
+                    onDismiss()
+                }) { Text("Save") }
+            }
+        },
+        dismissButton = { TextButton(onClick = ::close, enabled = analyzing == null) { Text(if (results != null) "Close" else "Cancel") } },
+    )
+}
+
+@Composable
+private fun FoundVoiceCard(
+    v: DiscoveredVoice,
+    controller: ShieldController,
+    names: androidx.compose.runtime.MutableState<Map<Int, String>>,
+    roles: androidx.compose.runtime.MutableState<Map<Int, VoiceRole>>,
+) {
+    val role = roles.value[v.number] ?: VoiceRole.SKIP
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Voice ${v.number}", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    Hint("${"%.0f".format(v.found.speechSeconds)} s of speech found")
+                }
+                FilledTonalButton(onClick = { controller.playClip(v.found.clip) }) {
+                    Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Play")
+                }
+            }
+            v.knownAs?.let { Hint("Sounds like ${it.name} (${(v.knownScore * 100).toInt()}% match), who is already saved.") }
+            v.maybeSameAs?.let { Hint("Might be the same person as Voice $it. If so, give both the same name and choice.") }
+            if (v.found.consistency < 0.74f) Hint("This one may be a mix of people. Listen before choosing.")
+            val choices = listOf(VoiceRole.BLOCK to "Block", VoiceRole.ALLOW to "Allow", VoiceRole.ME to "Me", VoiceRole.SKIP to "Skip")
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                choices.forEachIndexed { i, (r, label) ->
+                    SegmentedButton(
+                        selected = role == r,
+                        onClick = { roles.value = roles.value + (v.number to r) },
+                        shape = SegmentedButtonDefaults.itemShape(i, choices.size),
+                    ) { Text(label) }
+                }
+            }
+            if (role == VoiceRole.BLOCK || role == VoiceRole.ALLOW) {
+                OutlinedTextField(
+                    value = names.value[v.number] ?: "",
+                    onValueChange = { names.value = names.value + (v.number to it) },
+                    label = { Text("Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+    }
 }

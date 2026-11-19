@@ -14,8 +14,8 @@ The APK is signed with a development key, so Play Protect may warn about an unkn
 ## Use
 
 1. **Start listening.** You hear the room through your earbuds, 3 s late by default.
-2. **Add a voice → Record now** while only that person is talking: at least 6 s of speech, around 12 s is best. **Use last 10 s** learns whoever just spoke.
-3. **Teach it my voice** (under *Never blocked*) so your own voice is never covered.
+2. **Learn voices from a conversation:** record 15–90 s of normal conversation. People can talk over each other. Earshield finds each person, lets you play a short clip of each through your earbuds, and you mark them **Block**, **Allow**, **Me** or **Skip**. Only the voiceprints you keep are saved; the recording is discarded.
+3. Or add people one at a time: **Add one voice** (to block), **Allow one voice**, or **Teach it my voice**, each recorded while only that person talks.
 4. When a blocked voice is detected, it's covered (soft noise by default), and the phone buzzes once.
 5. If someone is covered by mistake, tap **Not them** under *Recently covered*. That voice is then treated as allowed.
 
@@ -27,6 +27,7 @@ The APK is signed with a development key, so Play Protect may warn about an unkn
 | **Match needed** | How similar a voice must be to block it (default 42%). Raise it if friends get covered; lower it if a blocked person gets through. |
 | **When they talk over someone** | **Separate** (default) pulls their voice out of the mix; **Turn down** lowers both; **Cover** covers both. |
 | **Cover with** | Soft noise, silence, or quieter. |
+| **Block everyone I haven't allowed** | Only you and your allowed voices are heard; anyone else is covered. |
 | **Pause blocking** | Lets everything through, for when you need to hear a blocked person. |
 
 ## How it works

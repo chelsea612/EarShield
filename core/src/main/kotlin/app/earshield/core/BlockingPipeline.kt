@@ -29,6 +29,8 @@ data class BlockingSettings(
     val overlap: OverlapStyle = OverlapStyle.SEPARATE,
     /** When false, everything is passed through (blocked voices are still detected and reported). */
     val blockingEnabled: Boolean = true,
+    /** Cover everyone who isn't an allowed voice (you, friends, "Not them"), not just blocked voices. */
+    val blockStrangers: Boolean = false,
 ) {
     companion object {
         const val DEFAULT_THRESHOLD = 0.42f
@@ -104,6 +106,8 @@ class BlockingPipeline(
     private var separatedUntil = 0L
     private val history = SampleRing(AudioFormat.samples(HISTORY_SECONDS))
     private var enrollment: SampleRing? = null
+    /** Everything the mic hears while learning voices from a conversation (kept in memory only). */
+    private var capture: SampleRing? = null
 
     private var received = 0L
     @Volatile private var playPos = 0L
@@ -148,6 +152,7 @@ class BlockingPipeline(
         }
         input.write(chunk)
         received += chunk.size
+        synchronized(this) { capture?.let { if (it.size + chunk.size <= it.capacity) it.write(chunk) } }
 
         trackSpeech(chunk)
 
@@ -335,8 +340,12 @@ class BlockingPipeline(
                 val match = VoiceMatcher.best(centroid, voices)
                 val voice = match.voice
                 val threshold = if (part.fromOverlap) s.threshold - OVERLAP_RELAX else s.threshold
-                part.blocked = voice != null && match.score >= threshold &&
+                val blockedVoice = voice != null && match.score >= threshold &&
                     match.score - match.allowedScore >= ALLOWED_MARGIN
+                // "Block strangers": anyone who doesn't match an allowed voice is covered too.
+                val stranger = s.blockStrangers && !blockedVoice && match.allowedScore < threshold
+                part.blocked = blockedVoice || stranger
+                val coverAs = if (blockedVoice) voice else if (stranger) STRANGER else null
                 part.track.blocked = part.blocked
                 if (DEBUG) println("  t=%.1f k=%d part=%d/%d overlapOnly=%s n=%d score=%.2f allowed=%.2f blocked=%s".format(
                     end / 16000f, k, i + 1, list.size, part.fromOverlap, part.track.count, match.score, match.allowedScore, part.blocked))
@@ -344,14 +353,15 @@ class BlockingPipeline(
                     latestEnd = lastActive
                     latestMatch = match
                 }
-                if (part.blocked && voice != null) {
+                if (part.blocked && coverAs != null) {
                     coveringNow += part.track
-                    if (part.track.covering?.id != voice.id) {
-                        part.track.covering = voice
+                    if (part.track.covering?.id != coverAs.id) {
+                        part.track.covering = coverAs
                         var runStart = lastActive
                         while (runStart > part.fromFrame && act.active[k][runStart - 1]) runStart--
                         val leaked = max(0L, playPos - sampleAt(runStart))
-                        listener?.onBlockStarted(voice, match.score, AudioFormat.seconds(leaked), centroid)
+                        val score = if (coverAs === STRANGER) match.allowedScore else match.score
+                        listener?.onBlockStarted(coverAs, score, AudioFormat.seconds(leaked), centroid)
                     }
                 }
             }
@@ -443,7 +453,8 @@ class BlockingPipeline(
     private fun separate(audio: FloatArray, windowStart: Long, from: Long, end: Long, voices: List<VoiceProfile>, s: BlockingSettings) {
         val sep = separator ?: return
         val blockedVoices = voices.filter { !it.allowed }
-        if (blockedVoices.isEmpty()) return
+        val allowedVoices = voices.filter { it.allowed }
+        if (if (s.blockStrangers) allowedVoices.isEmpty() else blockedVoices.isEmpty()) return
         val merge = AudioFormat.samples(SEP_MERGE_SECONDS)
         val runs = ArrayList<LongArray>()
         var i = max(from, 0L)
@@ -468,16 +479,37 @@ class BlockingPipeline(
             val chunk = audio.copyOfRange((ctxStart - windowStart).toInt(), (b - windowStart).toInt())
             val streams = sep.separate(chunk)
             scaleToMix(chunk, streams)
-            val score = FloatArray(2) { k -> blockedVoices.maxOf { v -> Vectors.dot(encoder.embed(streams[k]), v.embedding) } }
-            val jerry = if (score[0] >= score[1]) 0 else 1
-            val other = streams[1 - jerry]
+            val embeds = Array(2) { k -> encoder.embed(streams[k]) }
+            val near = s.threshold - SEP_SAME_MARGIN
+            val other: FloatArray
+            val swap: Boolean
+            val alone: Boolean
+            val score: FloatArray
+            val jerry: Int
+            if (s.blockStrangers) {
+                // Keep the stream that is an allowed voice; cover if neither is.
+                score = FloatArray(2) { k -> allowedVoices.maxOf { v -> Vectors.dot(embeds[k], v.embedding) } }
+                val keep = if (score[0] >= score[1]) 0 else 1
+                jerry = 1 - keep
+                other = streams[keep]
+                val keepLevel = rms(other) / rms(chunk).coerceAtLeast(1e-9f)
+                val keepOk = score[keep] >= near && keepLevel >= SEP_MIN_LEVEL
+                if (keepOk && score[jerry] >= near) continue // both allowed: nothing to remove
+                swap = keepOk
+                alone = !keepOk
+            } else {
+                score = FloatArray(2) { k -> blockedVoices.maxOf { v -> Vectors.dot(embeds[k], v.embedding) } }
+                jerry = if (score[0] >= score[1]) 0 else 1
+                other = streams[1 - jerry]
+                val level = rms(other) / rms(chunk).coerceAtLeast(1e-9f)
+                // Only swap in the other stream when the split is clear: one stream is recognizably the
+                // blocked person and the other isn't. If both sound like them, they were talking alone:
+                // cover. If neither is recognizable (too little audio), keep the cover/turn-down decision.
+                val recognized = score[jerry] >= near
+                alone = recognized && (score[1 - jerry] >= near || level < SEP_MIN_LEVEL)
+                swap = recognized && !alone
+            }
             val otherLevel = rms(other) / rms(chunk).coerceAtLeast(1e-9f)
-            // Only swap in the other stream when the split is clear: one stream is recognizably the
-            // blocked person and the other isn't. If both sound like them, they were talking alone:
-            // cover. If neither is recognizable (too little audio), keep the cover/turn-down decision.
-            val recognized = score[jerry] >= s.threshold - SEP_SAME_MARGIN
-            val alone = recognized && (score[1 - jerry] >= s.threshold - SEP_SAME_MARGIN || otherLevel < SEP_MIN_LEVEL)
-            val swap = recognized && !alone
             if (DEBUG) println("  separate %.1f–%.1f s: scores %.2f/%.2f, other level %.2f -> %s".format(
                 a / 16000f, b / 16000f, score[jerry], score[1 - jerry], otherLevel,
                 if (swap) "replace" else if (alone) "cover" else "unclear, keep"))
@@ -675,6 +707,25 @@ class BlockingPipeline(
 
     // --- Enrollment -----------------------------------------------------------------------------
 
+    /** Starts recording everything the mic hears, for learning voices from a conversation. */
+    @Synchronized fun startCapture(maxSeconds: Float) {
+        capture = SampleRing(AudioFormat.samples(maxSeconds))
+    }
+
+    /** Seconds recorded so far, or null if not recording. */
+    @Synchronized fun captureSeconds(): Float? = capture?.let { AudioFormat.seconds(it.size.toLong()) }
+
+    /** Stops recording and returns the audio (null if not recording). */
+    @Synchronized fun finishCapture(): FloatArray? {
+        val c = capture ?: return null
+        capture = null
+        return c.latest(c.size)
+    }
+
+    @Synchronized fun cancelCapture() {
+        capture = null
+    }
+
     /** Starts collecting speech for a new voiceprint. */
     @Synchronized fun startEnrollment() {
         enrollment = SampleRing(AudioFormat.samples(Enrollment.MAX_SECONDS))
@@ -698,6 +749,8 @@ class BlockingPipeline(
     @Synchronized fun recentSpeech(seconds: Float): FloatArray = history.latest(AudioFormat.samples(seconds))
 
     companion object {
+        /** Stands in for "someone who isn't on the allow list" in block events. */
+        val STRANGER = VoiceProfile("stranger", "Someone not on your allow list", FloatArray(0))
         const val MIN_DELAY_SECONDS = 1f
         const val MAX_DELAY_SECONDS = 5f
         private val DEBUG = System.getProperty("earshield.debug") == "1"

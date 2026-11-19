@@ -89,3 +89,20 @@ y = seg.run(None, {"x": ov[None, None]})[0][0]
 json.dump({"fbank_raw": fb.tolist(), "resnet_embedding": emb.tolist(), "seg_argmax": y.argmax(-1).tolist()},
           open(f"{out}/reference_v2.json", "w"))
 print("frames", fb.shape, "seg frames", y.shape, "classes used", sorted(set(y.argmax(-1).tolist())))
+
+# --- Three people: turns, quick back-and-forth and overlaps (for learning voices from a conversation) ---
+A, B, C = FRIEND, BLOCKED, "3005"
+plan = [  # (who, speaker, file index, seconds, start)
+    ("A", A, 1, 5, 0.0), ("B", B, 1, 4, 5.0), ("C", C, 1, 5, 9.0),
+    ("A", A, 2, 4, 13.0),                       # A starts while C finishes (1 s overlap)
+    ("B", B, 2, 5, 17.5), ("C", C, 2, 3, 19.0),  # C talks over B
+    ("A", A, 3, 5, 23.0), ("B", B, 3, 4, 28.5), ("C", C, 3, 5, 33.0),
+    ("A", A, 5, 3, 37.0),                        # A interrupts C
+    ("B", B, 5, 5, 40.5), ("C", C, 5, 4, 46.0),
+]
+parts = [(who, speech(spk, f, secs) * 0.5, start) for who, spk, f, secs, start in plan]
+mix, labels = sequence(parts)
+save("three_people", mix, labels)
+save("three_people_room", room(mix), labels)
+sf.write(f"{out}/friend_enroll.wav", speech(FRIEND, 0, 15), SR, subtype="PCM_16")
+print("three_people:", len(mix) / SR, "s")

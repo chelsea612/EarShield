@@ -21,6 +21,7 @@ data class AppSettings(
     val threshold: Float = BlockingSettings().threshold,
     val cover: CoverStyle = BlockingSettings().cover,
     val overlap: OverlapStyle = BlockingSettings().overlap,
+    val blockStrangers: Boolean = false,
     val buzzOnBlock: Boolean = true,
 )
 
@@ -41,6 +42,7 @@ class SettingsStore(context: Context) {
             threshold = prefs.getFloat("threshold", d.threshold),
             cover = enumOr(prefs.getString("cover", null), d.cover),
             overlap = enumOr(prefs.getString("overlap", null), d.overlap),
+            blockStrangers = prefs.getBoolean("blockStrangers", d.blockStrangers),
             buzzOnBlock = prefs.getBoolean("buzzOnBlock", d.buzzOnBlock),
         )
     }
@@ -54,6 +56,7 @@ class SettingsStore(context: Context) {
             .putFloat("threshold", s.threshold)
             .putString("cover", s.cover.name)
             .putString("overlap", s.overlap.name)
+            .putBoolean("blockStrangers", s.blockStrangers)
             .putBoolean("buzzOnBlock", s.buzzOnBlock)
             .apply()
     }

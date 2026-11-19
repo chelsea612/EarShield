@@ -12,6 +12,8 @@ import app.earshield.core.BlockingPipeline
 import app.earshield.core.BlockingSettings
 import app.earshield.core.Enrollment
 import app.earshield.core.SpeakerSegmenter
+import app.earshield.core.Vectors
+import app.earshield.core.VoiceDiscovery
 import app.earshield.core.SpeechSeparator
 import app.earshield.core.WespeakerEncoder
 import app.earshield.core.SileroVad
@@ -44,6 +46,19 @@ class BlockEvent(
     fun copy(corrected: Boolean) = BlockEvent(id, name, timeMillis, leakedSeconds, score, heard, corrected)
 }
 
+enum class VoiceRole { BLOCK, ALLOW, ME, SKIP }
+
+/** A person found in a recorded conversation, waiting for you to label them. */
+class DiscoveredVoice(
+    val number: Int,
+    val found: VoiceDiscovery.FoundVoice,
+    /** An already-saved voice this sounds like, if any. */
+    val knownAs: VoiceProfile?,
+    val knownScore: Float,
+    /** Another found voice (by number) that this is probably the same person as. */
+    val maybeSameAs: Int?,
+)
+
 sealed interface SaveOutcome {
     data object Saved : SaveOutcome
     data class Failed(val message: String) : SaveOutcome
@@ -60,6 +75,10 @@ data class LiveStatus(
     val closestScore: Float = 0f,
     val blockingName: String? = null,
     val enrollingSeconds: Float? = null,
+    /** Seconds of conversation recorded so far while learning voices, or null. */
+    val captureSeconds: Float? = null,
+    /** 0–1 while finding voices in a recording, or null. */
+    val discoveryProgress: Float? = null,
     /** Mic level in dBFS and speech probability, updated about 8 times a second. */
     val micDb: Float = -120f,
     val speechProbability: Float = 0f,
@@ -87,6 +106,9 @@ class ShieldController(private val context: Context) : BlockingListener {
     val status: StateFlow<LiveStatus> = _status.asStateFlow()
 
     private var encoder: WespeakerEncoder? = null
+    private var segmenter: SpeakerSegmenter? = null
+    private var separator: SpeechSeparator? = null
+    private var captureJob: Job? = null
     private var pipeline: BlockingPipeline? = null
     private var engine: AudioEngine? = null
     private var engineMode: InputMode? = null
@@ -105,7 +127,7 @@ class ShieldController(private val context: Context) : BlockingListener {
     }
 
     private fun AppSettings.toBlocking(paused: Boolean) =
-        BlockingSettings(delaySeconds, threshold, cover, overlap, blockingEnabled = !paused)
+        BlockingSettings(delaySeconds, threshold, cover, overlap, blockingEnabled = !paused, blockStrangers = blockStrangers)
 
     // --- Start / stop -----------------------------------------------------------------------
 
@@ -147,6 +169,7 @@ class ShieldController(private val context: Context) : BlockingListener {
             engineMode = null
         }
         cancelEnrollment()
+        cancelCapture()
         _status.update {
             it.copy(running = false, starting = false, speaking = false, blockingName = null,
                 micDb = -120f, speechProbability = 0f, micSilent = false, outputMuted = false)
@@ -158,13 +181,9 @@ class ShieldController(private val context: Context) : BlockingListener {
         fun bytes(name: String) = assets.open(name).use { it.readBytes() }
         val enc = WespeakerEncoder(bytes("speaker_encoder.onnx"))
         encoder = enc
-        return BlockingPipeline(
-            enc,
-            SpeakerSegmenter(bytes("speaker_segmentation.onnx")),
-            SileroVad(bytes("silero_vad.onnx")),
-            listener = this,
-            separator = SpeechSeparator(bytes("speech_separator.onnx"), threads = 2),
-        )
+        val seg = SpeakerSegmenter(bytes("speaker_segmentation.onnx")).also { segmenter = it }
+        val sep = SpeechSeparator(bytes("speech_separator.onnx"), threads = 2).also { separator = it }
+        return BlockingPipeline(enc, seg, SileroVad(bytes("silero_vad.onnx")), listener = this, separator = sep)
     }
 
     private fun startEngine(p: BlockingPipeline) {
@@ -283,7 +302,7 @@ class ShieldController(private val context: Context) : BlockingListener {
     }
 
     private fun store(name: String, result: Enrollment.Result, allowed: Boolean) {
-        voiceStore.add(name.trim().ifEmpty { if (allowed) "You" else "Blocked voice" }, result.embedding, allowed)
+        voiceStore.add(name.trim().ifEmpty { if (allowed) "Allowed voice" else "Blocked voice" }, result.embedding, allowed)
     }
 
     /** "That wasn't them": remember what was heard as a voice that is never blocked. */
@@ -291,9 +310,95 @@ class ShieldController(private val context: Context) : BlockingListener {
         val event = _status.value.recentBlocks.firstOrNull { it.id == eventId } ?: return
         if (event.corrected) return
         val time = java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(event.timeMillis))
-        voiceStore.add("Not ${event.name} ($time)", event.heard, allowed = true)
+        val name = if (event.name == BlockingPipeline.STRANGER.name) "Allowed voice ($time)" else "Not ${event.name} ($time)"
+        voiceStore.add(name, event.heard, allowed = true)
         _status.update { st -> st.copy(recentBlocks = st.recentBlocks.map { if (it.id == eventId) it.copy(corrected = true) else it }) }
     }
 
     fun removeVoice(id: String) = voiceStore.remove(id)
+
+    // --- Learning voices from a conversation -------------------------------------------------------
+
+    /** Starts recording the conversation (up to 90 s, in memory only). Listening must be running. */
+    fun startCapture() {
+        val p = pipeline ?: return
+        p.startCapture(VoiceDiscovery.MAX_RECORDING_SECONDS)
+        captureJob?.cancel()
+        captureJob = scope.launch {
+            while (isActive) {
+                _status.update { it.copy(captureSeconds = p.captureSeconds()) }
+                delay(250)
+            }
+        }
+    }
+
+    fun cancelCapture() {
+        captureJob?.cancel()
+        captureJob = null
+        pipeline?.cancelCapture()
+        _status.update { it.copy(captureSeconds = null, discoveryProgress = null) }
+    }
+
+    /** Stops recording and finds the people in it. The recording is dropped once this returns. */
+    suspend fun findVoices(): List<DiscoveredVoice> {
+        captureJob?.cancel()
+        captureJob = null
+        val audio = pipeline?.finishCapture()
+        _status.update { it.copy(captureSeconds = null, discoveryProgress = 0f) }
+        val enc = encoder
+        val seg = segmenter
+        if (audio == null || enc == null || seg == null) {
+            _status.update { it.copy(discoveryProgress = null) }
+            return emptyList()
+        }
+        return withContext(Dispatchers.Default) {
+            val found = VoiceDiscovery(enc, seg, separator).discover(audio) { p ->
+                _status.update { it.copy(discoveryProgress = p) }
+            }
+            val known = voiceStore.voices.value.filterNot { it.name.startsWith("Not ") || it.name.startsWith("Allowed voice (") }
+            val threshold = settingsStore.settings.value.threshold
+            val result = found.mapIndexed { i, v ->
+                val best = known.maxByOrNull { Vectors.dot(v.embedding, it.embedding) }
+                val bestScore = best?.let { Vectors.dot(v.embedding, it.embedding) } ?: 0f
+                val sameAs = found.indices.filter { it < i }.firstOrNull { j ->
+                    Vectors.dot(v.embedding, found[j].embedding) >= POSSIBLY_SAME
+                }
+                DiscoveredVoice(
+                    number = i + 1,
+                    found = v,
+                    knownAs = if (best != null && bestScore >= threshold) best else null,
+                    knownScore = bestScore,
+                    maybeSameAs = sameAs?.plus(1),
+                )
+            }
+            _status.update { it.copy(discoveryProgress = null) }
+            result
+        }
+    }
+
+    /** Plays a found voice's sample through the earbuds (never the phone speaker). */
+    fun playClip(clip: FloatArray) {
+        var sq = 0.0
+        for (x in clip) sq += x * x
+        val rms = kotlin.math.sqrt(sq / clip.size.coerceAtLeast(1)).toFloat().coerceAtLeast(1e-6f)
+        val gain = (0.08f / rms).coerceAtMost(30f)
+        engine?.playPreview(FloatArray(clip.size) { (clip[it] * gain).coerceIn(-1f, 1f) })
+    }
+
+    /** Saves the voices you labeled. */
+    fun saveDiscovered(choices: List<Triple<DiscoveredVoice, String, VoiceRole>>) {
+        for ((v, name, role) in choices) {
+            when (role) {
+                VoiceRole.SKIP -> Unit
+                VoiceRole.BLOCK -> voiceStore.add(name.trim().ifEmpty { "Blocked voice ${v.number}" }, v.found.embedding, allowed = false)
+                VoiceRole.ALLOW -> voiceStore.add(name.trim().ifEmpty { "Allowed voice ${v.number}" }, v.found.embedding, allowed = true)
+                VoiceRole.ME -> voiceStore.add("You", v.found.embedding, allowed = true)
+            }
+        }
+    }
+
+    private companion object {
+        /** Two found voices this alike are probably one person who got split up. */
+        const val POSSIBLY_SAME = 0.45f
+    }
 }
