@@ -92,3 +92,47 @@ class SampleRing(val capacity: Int) {
         written = 0
     }
 }
+
+/** In-place radix-2 complex FFT (forward, or inverse without the 1/N scaling). */
+class Fft(private val n: Int) {
+    private val cosT = DoubleArray(n / 2) { kotlin.math.cos(-2 * Math.PI * it / n) }
+    private val sinT = DoubleArray(n / 2) { kotlin.math.sin(-2 * Math.PI * it / n) }
+
+    init {
+        require(n > 0 && n and (n - 1) == 0) { "FFT size must be a power of two" }
+    }
+
+    fun transform(re: DoubleArray, im: DoubleArray, inverse: Boolean = false) {
+        var j = 0
+        for (i in 1 until n) {
+            var bit = n shr 1
+            while (j and bit != 0) {
+                j = j xor bit
+                bit = bit shr 1
+            }
+            j = j xor bit
+            if (i < j) {
+                var t = re[i]; re[i] = re[j]; re[j] = t
+                t = im[i]; im[i] = im[j]; im[j] = t
+            }
+        }
+        val sign = if (inverse) -1.0 else 1.0
+        var len = 2
+        while (len <= n) {
+            val step = n / len
+            for (i in 0 until n step len) {
+                for (k in 0 until len / 2) {
+                    val wr = cosT[k * step]
+                    val wi = sign * sinT[k * step]
+                    val a = i + k
+                    val b = a + len / 2
+                    val xr = re[b] * wr - im[b] * wi
+                    val xi = re[b] * wi + im[b] * wr
+                    re[b] = re[a] - xr; im[b] = im[a] - xi
+                    re[a] += xr; im[a] += xi
+                }
+            }
+            len = len shl 1
+        }
+    }
+}

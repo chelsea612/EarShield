@@ -162,6 +162,7 @@ fun MainScreen(controller: ShieldController) {
             }
             item { MicCard(settings, status.running) { mode -> controller.settingsStore.update { it.copy(inputMode = mode) } } }
             item { BlockingCard(settings) { change -> controller.settingsStore.update(change) } }
+            item { SoundCard(settings) { change -> controller.settingsStore.update(change) } }
             if (status.recentBlocks.isNotEmpty()) item { RecentCard(status, controller::markNotThem) }
             item {
                 Text(
@@ -468,6 +469,28 @@ private fun EditVoiceDialog(
 /** Below this similarity, merging two voices probably combines two different people. */
 private const val MERGE_WARN = 0.40f
 
+/** Noise reduction, distant-chatter reduction, and a masking noise bed. */
+@Composable
+private fun SoundCard(settings: AppSettings, onChange: ((AppSettings) -> AppSettings) -> Unit) {
+    SectionCard {
+        SectionTitle("Sound")
+        fun pct(v: Float) = if (v <= 0f) "Off" else "${(v * 100).roundToInt()}%"
+        LabeledSlider("Background noise reduction", settings.noiseReduction, pct(settings.noiseReduction), 0f..1f, 9) { v ->
+            onChange { it.copy(noiseReduction = (v * 10).roundToInt() / 10f) }
+        }
+        Hint("Turns down traffic, hum and hiss while keeping voices. At full strength some voices get a little quieter too.")
+        LabeledSlider("Background chatter", settings.chatterReduction, pct(settings.chatterReduction), 0f..1f, 9) { v ->
+            onChange { it.copy(chatterReduction = (v * 10).roundToInt() / 10f) }
+        }
+        Hint("Turns down distant voices that are much quieter than your conversation, in the pauses between turns. " +
+            "Works best after \"Teach it my voice\", since your own voice is the loudest the mic hears.")
+        LabeledSlider("Masking noise (brown)", settings.maskingNoise, pct(settings.maskingNoise), 0f..1f, 9) { v ->
+            onChange { it.copy(maskingNoise = (v * 10).roundToInt() / 10f) }
+        }
+        Hint("A steady, deep rumble under everything, to hide sound leaking in around your earbuds.")
+    }
+}
+
 @Composable
 private fun MicCard(settings: AppSettings, running: Boolean, onChange: (InputMode) -> Unit) {
     SectionCard {
@@ -540,7 +563,7 @@ private fun BlockingCard(settings: AppSettings, onChange: ((AppSettings) -> AppS
         })
 
         Text("Cover blocked speech with", style = MaterialTheme.typography.bodyMedium)
-        val covers = listOf(CoverStyle.SOFT_NOISE to "Soft noise", CoverStyle.SILENCE to "Silence", CoverStyle.QUIETER to "Quieter")
+        val covers = listOf(CoverStyle.NATURAL to "Natural", CoverStyle.SILENCE to "Silence", CoverStyle.QUIETER to "Quieter", CoverStyle.SOFT_NOISE to "Hush")
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
             covers.forEachIndexed { i, (style, label) ->
                 SegmentedButton(
@@ -879,6 +902,7 @@ private fun WhoIsTalkingCard(status: LiveStatus, controller: ShieldController) {
                             LiveSpeaker.Role.BLOCKED -> "Blocked"
                             LiveSpeaker.Role.ALLOWED -> "Allowed"
                             LiveSpeaker.Role.UNKNOWN -> "Not saved"
+                            LiveSpeaker.Role.BACKGROUND -> "Background talker"
                         })
                         if (row.role != LiveSpeaker.Role.UNKNOWN) append(" · ${(row.score * 100).toInt()}% match")
                         if (row.talkingNow) append(if (row.covered) " · talking, covered" else " · talking")

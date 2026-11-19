@@ -10,7 +10,13 @@ import kotlin.math.min
 import kotlin.math.sqrt
 import kotlin.random.Random
 
-enum class CoverStyle { SILENCE, SOFT_NOISE, QUIETER }
+enum class CoverStyle {
+    /** Remove the voice but keep the room's own sound (needs the speech enhancer; otherwise like SILENCE). */
+    NATURAL,
+    SILENCE,
+    SOFT_NOISE,
+    QUIETER,
+}
 
 /** What to do when a blocked person talks at the same time as someone else. */
 enum class OverlapStyle {
@@ -25,12 +31,18 @@ data class BlockingSettings(
     val delaySeconds: Float = 3f,
     /** Voice similarity needed to block (cosine, −1 to 1). */
     val threshold: Float = DEFAULT_THRESHOLD,
-    val cover: CoverStyle = CoverStyle.SOFT_NOISE,
+    val cover: CoverStyle = CoverStyle.NATURAL,
     val overlap: OverlapStyle = OverlapStyle.SEPARATE,
     /** When false, everything is passed through (blocked voices are still detected and reported). */
     val blockingEnabled: Boolean = true,
     /** Cover everyone who isn't an allowed voice (you, friends, "Not them"), not just blocked voices. */
     val blockStrangers: Boolean = false,
+    /** 0–1: how much background noise (traffic, hum, hiss) to remove. Needs the speech enhancer. */
+    val noiseReduction: Float = 0f,
+    /** 0–1: how much to turn down distant talkers who aren't part of your conversation. */
+    val chatterReduction: Float = 0f,
+    /** 0–1: level of a steady brown-noise bed that masks sound leaking in around the earbuds. */
+    val maskingNoise: Float = 0f,
 ) {
     companion object {
         const val DEFAULT_THRESHOLD = 0.42f
@@ -54,7 +66,7 @@ class LiveSpeaker(
     /** How many measurements the voiceprint is built from (more = more reliable). */
     val evidence: Int,
 ) {
-    enum class Role { BLOCKED, ALLOWED, UNKNOWN }
+    enum class Role { BLOCKED, ALLOWED, UNKNOWN, BACKGROUND }
 }
 
 interface BlockingListener {
@@ -111,6 +123,11 @@ class BlockingPipeline(
         Thread(r, "earshield-analysis").apply { isDaemon = true; priority = Thread.NORM_PRIORITY + 1 }
     },
     private val random: Random = Random.Default,
+    /**
+     * Optional: makes speech enhancers, which split speech from background so covering keeps the room
+     * sound and noise can be reduced. Two are used (each is stateful).
+     */
+    private val enhancerFactory: (() -> SpeechEnhancer)? = null,
 ) {
     @Volatile var settings = BlockingSettings()
     @Volatile var voices: List<VoiceProfile> = emptyList()
@@ -147,7 +164,23 @@ class BlockingPipeline(
     private var probMax = 0f
 
     // Output
+    private val enhancer: SpeechEnhancer? = enhancerFactory?.invoke()
     private var gain = 1f
+    private var chatGain = 1f
+    /** Speech-only version of [input] (from [enhancer]), valid below [speechUntil]. */
+    private val speech = FloatArray(input.capacity)
+    private var speechOut = 0L
+    @Volatile private var speechUntil = 0L
+    /** Target gain for distant chatter, written by the analysis thread. */
+    private val chatterGains = FloatArray(input.capacity) { 1f }
+    private val roomChatterGains = FloatArray(input.capacity) { 1f }
+    private var roomChatGain = 1f
+    private var brown = 0f
+    /** A few seconds of the room recorded while no one was talking, played while covering a voice. */
+    private val roomTone = SampleRing(AudioFormat.samples(ROOM_TONE_SECONDS))
+    private var toneSnapshot = FloatArray(0)
+    private var tonePos = 0
+    private var toneStep = 1
     private var repGain = 0f
     private var noise = 0f
 
@@ -155,6 +188,10 @@ class BlockingPipeline(
     private val tracks = ArrayList<Track>()
 
     private class Track(val id: Int, var sum: FloatArray, var count: Int, var lastSeen: Long) {
+        /** Loudness of this voice's solo speech (dBFS, smoothed), for telling near from far talkers. */
+        var levelDb = Float.NaN
+        /** Judged a distant talker who isn't part of the conversation. */
+        var background = false
         val centroid: FloatArray get() = Vectors.normalized(sum)
         var covering: VoiceProfile? = null
         /** The latest decision for this voice. */
@@ -172,8 +209,19 @@ class BlockingPipeline(
             coveredBy[j] = -1
             replaced[j] = false
             overlapped[j] = false
+            chatterGains[j] = 1f
+            roomChatterGains[j] = 1f
         }
         input.write(chunk)
+        enhancer?.let { enh ->
+            // Output n is the speech-only version of input n − HOP.
+            for (v in enh.process(chunk)) {
+                val idx = speechOut - SpeechEnhancer.HOP
+                if (idx >= 0) speech[(idx % speech.size).toInt()] = v
+                speechOut++
+            }
+            speechUntil = speechOut - SpeechEnhancer.HOP
+        }
         received += chunk.size
         synchronized(this) { capture?.let { if (it.size + chunk.size <= it.capacity) it.write(chunk) } }
 
@@ -201,6 +249,7 @@ class BlockingPipeline(
     private fun trackSpeech(chunk: FloatArray) {
         val p = vad.speechProbability(boostForVad(chunk))
         reportLevel(chunk, p)
+        if (p < ROOM_TONE_MAX_SPEECH) synchronized(roomTone) { roomTone.write(chunk) }
         synchronized(this) {
             if (!inSpeech && p >= SPEECH_ON) {
                 inSpeech = true
@@ -300,7 +349,7 @@ class BlockingPipeline(
                 list = when {
                     solo != null -> {
                         embeddedUntil = windowStart + solo.end
-                        listOf(Part(0, assignTrack(encoder.embed(solo.audio), end, prev?.track), false))
+                        listOf(Part(0, assignTrack(encoder.embed(solo.audio), end, prev?.track).also { noteLevel(it, solo.audio) }, false))
                     }
                     prev != null -> listOf(Part(0, prev.track, true))
                     lastActive >= firstDecisionFrame -> {
@@ -321,6 +370,7 @@ class BlockingPipeline(
                 val fresh = speechOf(audio, act, k, soloOnly = true, fromOffset = fromOffset)
                 list = if (fresh != null && fresh.audio.size >= AudioFormat.samples(needed)) {
                     val e = encoder.embed(fresh.audio)
+                    noteLevel(prev.track, fresh.audio)
                     val sim = Vectors.dot(e, prev.track.centroid)
                     val full = fresh.audio.size >= AudioFormat.samples(EMBED_MAX_SECONDS)
                     when {
@@ -353,6 +403,11 @@ class BlockingPipeline(
         var latestMatch: VoiceMatch? = null
         var latestEnd = -1
         val coveringNow = HashSet<Track>()
+        // The loudest recent voice that isn't you sets the level of "the conversation"; voices far
+        // quieter than that, not on the allow list, are distant chatter.
+        val refDb = tracks.filter { end - it.lastSeen <= AudioFormat.samples(LIVE_LIST_SECONDS) && !it.levelDb.isNaN() }
+            .filterNot { t -> VoiceMatcher.best(t.centroid, voices).let { m -> m.allowedVoice?.name == ME_NAME && m.allowedScore >= s.threshold } }
+            .maxOfOrNull { it.levelDb }
         for (k in 0 until SpeakerSegmenter.SPEAKERS) {
             val list = parts[k] ?: continue
             for ((i, part) in list.withIndex()) {
@@ -370,6 +425,11 @@ class BlockingPipeline(
                 part.blocked = blockedVoice || stranger
                 val coverAs = if (blockedVoice) voice else if (stranger) STRANGER else null
                 part.track.blocked = part.blocked
+                val lvl = part.track.levelDb
+                part.track.background = s.chatterReduction > 0f && !part.blocked && match.allowedScore < threshold &&
+                    refDb != null && !lvl.isNaN() && lvl <= refDb - CHATTER_DB
+                if (DEBUG) println("    track %d level %.1f dB (conversation %.1f dB) background=%s".format(
+                    part.track.id, lvl, refDb ?: Float.NaN, part.track.background))
                 if (DEBUG) println("  t=%.1f k=%d part=%d/%d overlapOnly=%s n=%d score=%.2f allowed=%.2f blocked=%s".format(
                     end / 16000f, k, i + 1, list.size, part.fromOverlap, part.track.count, match.score, match.allowedScore, part.blocked))
                 if (lastActive > latestEnd) {
@@ -421,7 +481,8 @@ class BlockingPipeline(
                         embedding = c,
                         voice = if (blockedVoice) m.voice else if (allowedVoice) m.allowedVoice else null,
                         score = if (blockedVoice) m.score else if (allowedVoice) m.allowedScore else max(m.score, m.allowedScore),
-                        role = if (blockedVoice) LiveSpeaker.Role.BLOCKED else if (allowedVoice) LiveSpeaker.Role.ALLOWED else LiveSpeaker.Role.UNKNOWN,
+                        role = if (blockedVoice) LiveSpeaker.Role.BLOCKED else if (allowedVoice) LiveSpeaker.Role.ALLOWED
+                            else if (t.background) LiveSpeaker.Role.BACKGROUND else LiveSpeaker.Role.UNKNOWN,
                         talkingNow = t in talking,
                         covered = t.covering != null,
                         evidence = t.count,
@@ -447,6 +508,20 @@ class BlockingPipeline(
             }
             a
         }
+
+        // Which local speakers are distant chatter: their track says so, or (for voices not measured
+        // yet, e.g. a few words in a pause) their loudness in this window is far below the conversation.
+        val quickFar = BooleanArray(SpeakerSegmenter.SPEAKERS) { k ->
+            if (s.chatterReduction <= 0f || refDb == null) return@BooleanArray false
+            val known = parts[k]?.lastOrNull()?.track
+            if (known != null && !known.levelDb.isNaN()) return@BooleanArray false
+            if (known != null && (known.blocked || VoiceMatcher.best(known.centroid, voices).allowedScore >= s.threshold)) return@BooleanArray false
+            val db = activeLevelDb(audio, act, k) ?: return@BooleanArray false
+            db <= refDb - CHATTER_DB
+        }
+        fun isFar(k: Int, f: Int): Boolean = partAt(k, f)?.track?.background == true || quickFar[k]
+        var dbgReduced = 0
+        var dbgKept = 0
 
         // Write target gains for every unplayed sample in the window.
         val overlapGain = if (s.overlap == OverlapStyle.COVER) 0f else OVERLAP_GAIN
@@ -475,8 +550,29 @@ class BlockingPipeline(
                 otherActive || !blockedSoloCapable -> overlapGain
                 else -> 0f
             }
+            // Distant chatter: voices left over when no one from the conversation is talking (including
+            // talkers too faint for the segmentation model to pick out) are turned down. Near speech is
+            // padded a little so its edges aren't clipped.
+            var nearActive = blockedActive
+            for (k in 0 until SpeakerSegmenter.SPEAKERS) {
+                for (g in max(0, f - pad)..min(frames - 1, f + pad)) {
+                    if (act.active[k][g] && !isFar(k, g)) { nearActive = true; break }
+                }
+            }
+            val cg = if (!nearActive) 1f - s.chatterReduction else 1f
+            // Far voices with lots of echo land partly in the "background" part, so while a distant
+            // talker is heard on their own, turn the room sound down too. (Pauses with no voice at all,
+            // e.g. just traffic, are left alone, so the background doesn't pump up and down.)
+            val anyActive = (0 until SpeakerSegmenter.SPEAKERS).any { act.active[it][f] }
+            val rg = if (!nearActive && anyActive) 1f - s.chatterReduction else 1f
+            if (DEBUG && s.chatterReduction > 0f) { if (cg < 1f) dbgReduced++ else dbgKept++ }
             val from = max(sampleAt(f), decisionFrom)
             val to = if (f + 1 < frames) sampleAt(f + 1) else end
+            for (i in from until to) {
+                val j = (i % chatterGains.size).toInt()
+                chatterGains[j] = cg
+                roomChatterGains[j] = rg
+            }
             for (i in from until to) {
                 val j = (i % gains.size).toInt()
                 if (g < 1f) {
@@ -496,6 +592,9 @@ class BlockingPipeline(
                 }
             }
         }
+        if (DEBUG && s.chatterReduction > 0f) println("  t=%.1f chatter: %d frames turned down, %d kept; quickFar=%s; refDb=%s; active per spk=%s".format(
+            end / 16000f, dbgReduced, dbgKept, quickFar.toList(), refDb,
+            (0 until SpeakerSegmenter.SPEAKERS).map { k -> (firstDecisionFrame until frames).count { act.active[k][it] } }))
         if (separator != null && s.blockingEnabled && s.overlap == OverlapStyle.SEPARATE) separate(audio, windowStart, max(decisionFrom, separatedUntil), end, voices, s)
         tracks.removeAll { end - it.lastSeen > AudioFormat.samples(TRACK_MEMORY_SECONDS) && it.covering == null }
     }
@@ -727,15 +826,31 @@ class BlockingPipeline(
         val delay = AudioFormat.samples(s.delaySeconds.coerceIn(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS))
         var index = received - out.size - delay
         playPos = index + out.size
+        val hasSpeech = enhancer != null
+        val bgLevel = if (hasSpeech) 1f - s.noiseReduction.coerceIn(0f, 1f) else 1f
+        val mask = s.maskingNoise.coerceIn(0f, 1f) * MASK_MAX_RMS
         for (i in out.indices) {
             val x = input.at(index)
             val j = if (index >= 0) (index % gains.size).toInt() else -1
+            // Split the room into voice and background. Without the enhancer, everything counts as voice.
+            val haveSplit = hasSpeech && j >= 0 && index < speechUntil
+            val v = if (haveSplit) speech[j] else x
+            val bg = x - v
+            // While covering, the room's own sound is room tone recorded when no one was talking, so no
+            // trace of the covered voice comes through.
+            val tone = if (gain < 1f) nextTone() else 0f
             val useRep = s.blockingEnabled && j >= 0 && replaced[j]
             val target = if (useRep) 0f else if (s.blockingEnabled && j >= 0) gains[j] else 1f
             gain = when {
                 gain < target -> min(target, gain + 1f / FADE_SAMPLES)
                 gain > target -> max(target, gain - 1f / FADE_SAMPLES)
                 else -> gain
+            }
+            val chatTarget = if (j >= 0) chatterGains[j] else 1f
+            chatGain = when {
+                chatGain < chatTarget -> min(chatTarget, chatGain + 1f / FADE_SAMPLES)
+                chatGain > chatTarget -> max(chatTarget, chatGain - 1f / FADE_SAMPLES)
+                else -> chatGain
             }
             val repTarget = if (useRep) 1f else 0f
             repGain = when {
@@ -745,13 +860,67 @@ class BlockingPipeline(
             }
             val rep = if (j >= 0 && repGain > 0f) replacement[j] * repGain else 0f
             val covered = (1 - gain - repGain).coerceAtLeast(0f) // the part neither played nor replaced
-            out[i] = rep + when (s.cover) {
-                CoverStyle.SILENCE -> x * gain
-                CoverStyle.QUIETER -> x * (gain + QUIET_GAIN * covered)
-                CoverStyle.SOFT_NOISE -> x * gain + covered * nextNoise()
+            val roomTarget = if (j >= 0) roomChatterGains[j] else 1f
+            roomChatGain = when {
+                roomChatGain < roomTarget -> min(roomTarget, roomChatGain + 1f / FADE_SAMPLES)
+                roomChatGain > roomTarget -> max(roomTarget, roomChatGain - 1f / FADE_SAMPLES)
+                else -> roomChatGain
             }
+            val voice = v * chatGain
+            val room = (bg * gain + tone * (1 - gain)) * bgLevel * roomChatGain
+            out[i] = rep + when (s.cover) {
+                // Only the voice is covered; the room's own sound carries on.
+                CoverStyle.NATURAL -> voice * gain + room
+                CoverStyle.SILENCE -> (voice + room) * gain
+                CoverStyle.QUIETER -> (voice + room) * (gain + QUIET_GAIN * covered)
+                CoverStyle.SOFT_NOISE -> (voice + room) * gain + covered * nextNoise()
+            } + if (mask > 0f) nextBrown() * mask else 0f
             index++
         }
+    }
+
+    /**
+     * Next room-tone sample. The recording is played forward then backward, which loops seamlessly;
+     * a fresh copy is taken whenever a new covered stretch starts.
+     */
+    private fun nextTone(): Float {
+        if (gain >= 1f || toneSnapshot.isEmpty()) {
+            if (tonePos == 0 || toneSnapshot.isEmpty()) {
+                toneSnapshot = synchronized(roomTone) { if (roomTone.size >= AudioFormat.samples(0.5f)) roomTone.latest(roomTone.size) else FloatArray(0) }
+                tonePos = 0
+                toneStep = 1
+            }
+            if (toneSnapshot.isEmpty()) return 0f
+        }
+        val v = toneSnapshot[tonePos]
+        tonePos += toneStep
+        if (tonePos >= toneSnapshot.size) { tonePos = toneSnapshot.size - 1; toneStep = -1 }
+        if (tonePos < 0) { tonePos = 0; toneStep = 1 }
+        return v
+    }
+
+    /** Brown (red) noise with unit-ish RMS: a deep, even rumble that masks sound leaking in. */
+    private fun nextBrown(): Float {
+        brown = BROWN_LEAK * brown + (random.nextFloat() * 2 - 1) * BROWN_STEP
+        return brown
+    }
+
+    /** Loudness (dBFS) of speaker [k]'s solo speech in this window, if there's at least 0.3 s of it. */
+    private fun activeLevelDb(audio: FloatArray, act: SpeakerSegmenter.Activity, k: Int): Float? {
+        var sum = 0.0
+        var n = 0
+        for (f in 0 until act.frames) {
+            if (!act.active[k][f] || act.speakersAt(f) != 1) continue
+            val to = if (f + 1 < act.frames) act.frameStart(f + 1) else audio.size
+            for (i in act.frameStart(f) until to) { sum += audio[i] * audio[i].toDouble(); n++ }
+        }
+        if (n < AudioFormat.samples(0.3f)) return null
+        return (10 * log10((sum / n).coerceAtLeast(1e-18))).toFloat()
+    }
+
+    private fun noteLevel(track: Track, audio: FloatArray) {
+        val db = (20 * log10(rms(audio).coerceAtLeast(1e-9f).toDouble())).toFloat()
+        track.levelDb = if (track.levelDb.isNaN()) db else 0.7f * track.levelDb + 0.3f * db
     }
 
     /** Low-passed white noise: a soft "shhh" rather than a harsh hiss. */
@@ -808,6 +977,15 @@ class BlockingPipeline(
         val STRANGER = VoiceProfile("stranger", "Someone not on your allow list", FloatArray(0))
         const val MIN_DELAY_SECONDS = 1f
         const val TALKING_NOW_SECONDS = 1.5f
+        /** The name "Teach it my voice" saves your voice under; your voice doesn't set the conversation level. */
+        const val ME_NAME = "You"
+        /** Voices this much quieter than the conversation (and not allowed) count as distant chatter. */
+        const val CHATTER_DB = 12f
+        const val MASK_MAX_RMS = 0.03f // about −30 dBFS at full
+        const val ROOM_TONE_SECONDS = 3f
+        const val ROOM_TONE_MAX_SPEECH = 0.15f // chunks this unlikely to be speech count as room tone
+        const val BROWN_LEAK = 0.997f
+        const val BROWN_STEP = 0.128f // gives RMS ≈ 1 with the leak above
         const val LIVE_LIST_SECONDS = 30f
         const val MAX_DELAY_SECONDS = 5f
         private val DEBUG = System.getProperty("earshield.debug") == "1"

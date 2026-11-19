@@ -106,3 +106,57 @@ save("three_people", mix, labels)
 save("three_people_room", room(mix), labels)
 sf.write(f"{out}/friend_enroll.wav", speech(FRIEND, 0, 15), SR, subtype="PCM_16")
 print("three_people:", len(mix) / SR, "s")
+
+# --- Noise and chatter (for natural covering, noise reduction and background-chatter tests) ---
+def traffic_noise(n):
+    t = np.arange(n) / SR
+    w = np.cumsum(rng.standard_normal(n)); w -= np.convolve(w, np.ones(4000) / 4000, "same")
+    swell = np.clip(np.sin(2 * np.pi * t / 6.0), 0, None) ** 2 + 0.3
+    hiss = np.convolve(rng.standard_normal(n), np.hanning(9) / 4.5, "same")
+    x = w / w.std() + 0.6 * swell * hiss / hiss.std()
+    spec = np.fft.rfft(x); f = np.fft.rfftfreq(n, 1 / SR); spec[f < 60] = 0  # audible part of road noise
+    return np.fft.irfft(spec, n).astype(np.float32)
+
+def save_with_sources(name, srcs):
+    mix = sum(srcs.values())
+    peak = np.abs(mix).max()
+    for who, src in srcs.items():
+        sf.write(f"{out}/{name}_src_{who}.wav", (src / peak * 0.5).astype(np.float32), SR, subtype="PCM_16")
+    sf.write(f"{out}/{name}.wav", (mix / peak * 0.5).astype(np.float32), SR, subtype="PCM_16")
+
+# Turn-taking (friend / blocked) with traffic 10 dB below the voices.
+turns_mix, turns_labels = sequence([(w, a, s) for w, a, s in turns])
+srcs = {k: v.copy() for k, v in sources.items()}
+speech_rms = np.sqrt(np.mean(turns_mix[np.abs(turns_mix) > 1e-4] ** 2))
+nz = traffic_noise(len(turns_mix)); nz *= speech_rms / nz.std() * 10 ** (-10 / 20)
+srcs["noise"] = nz
+save_with_sources("noisy_turns", srcs)
+json.dump(turns_labels, open(f"{out}/noisy_turns_labels.json", "w"), indent=1)
+
+# A near conversation (A, C) with a far-away talker D, 15 dB quieter and echoey, talking throughout.
+near = [("A", speech(A, 6, 5) * 0.5, 0.0), ("C", speech(C, 6, 5) * 0.5, 6.5), ("A", speech(A, 7, 5) * 0.5, 13.0),
+        ("C", speech(C, 7, 5) * 0.5, 19.5)]  # natural 1.5 s pauses between turns
+near_mix, near_labels = sequence(near)
+srcs = {k: v.copy() for k, v in sources.items()}
+far = np.concatenate([librosa.load(f, sr=SR)[0] for f in sorted(glob.glob(f"{imp_dir}/*.flac"))[20:24]])
+far = np.convolve(far, rir(0.6, -3))[: len(near_mix)].astype(np.float32)
+far = np.pad(far, (0, max(0, len(near_mix) - len(far))))
+near_rms = np.sqrt(np.mean(near_mix[np.abs(near_mix) > 1e-4] ** 2))
+far *= near_rms / np.sqrt(np.mean(far[np.abs(far) > 1e-4] ** 2)) * 10 ** (-15 / 20)
+srcs["far"] = far
+save_with_sources("chatter", srcs)
+json.dump(near_labels, open(f"{out}/chatter_labels.json", "w"), indent=1)
+
+# Reference for the Kotlin speech-enhancer test: GTCRN output for the first 2 s of noisy_turns.
+gt = ort.InferenceSession(f"{hf}/gtcrn_simple.onnx")
+win = np.sqrt(np.hanning(513)[:512]).astype(np.float32)
+x = sf.read(f"{out}/noisy_turns.wav", dtype="float32")[0][:2 * SR]
+conv = np.zeros((2, 1, 16, 16, 33), np.float32); tra = np.zeros((2, 3, 1, 1, 16), np.float32); inter = np.zeros((2, 1, 33, 16), np.float32)
+pad = np.concatenate([np.zeros(256, np.float32), x, np.zeros(512, np.float32)]); y = np.zeros(len(pad) + 512, np.float32)
+for st in range(0, len(pad) - 512 + 1, 256):
+    spec = np.fft.rfft(pad[st:st + 512] * win)
+    e, conv, tra, inter = gt.run(None, {"mix": np.stack([spec.real, spec.imag], -1).astype(np.float32)[None, :, None, :],
+                                        "conv_cache": conv, "tra_cache": tra, "inter_cache": inter})
+    y[st:st + 512] += np.fft.irfft(e[0, :, 0, 0] + 1j * e[0, :, 0, 1], 512).astype(np.float32) * win
+json.dump({"enhanced": y[256:256 + 2 * SR].tolist()}, open(f"{out}/reference_enhance.json", "w"))
+print("noise/chatter fixtures written")

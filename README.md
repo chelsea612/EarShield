@@ -28,7 +28,10 @@ The APK is signed with a development key, so Play Protect may warn about an unkn
 | **Delay** | How late you hear the room (1–5 s). More time means better decisions. |
 | **Match needed** | How similar a voice must be to block it (default 42%). Raise it if friends get covered; lower it if a blocked person gets through. |
 | **When they talk over someone** | **Separate** (default) pulls their voice out of the mix; **Turn down** lowers both; **Cover** covers both. |
-| **Cover with** | Soft noise, silence, or quieter. |
+| **Cover with** | **Natural** (default: the voice is removed and the room's own sound carries on), silence, quieter, or a soft hush. |
+| **Background noise reduction** | Turns down traffic, hum and hiss while keeping voices (default 50%). |
+| **Background chatter** | Turns down distant voices far quieter than your conversation, in the pauses between turns. |
+| **Masking noise (brown)** | A steady deep rumble under everything, to hide sound leaking in around the earbuds. |
 | **Block everyone I haven't allowed** | Only you and your allowed voices are heard; anyone else is covered. |
 | **Pause blocking** | Lets everything through, for when you need to hear a blocked person. |
 
@@ -40,6 +43,8 @@ Every second, on a background thread, for the last 10 s of audio:
 2. **Who they are:** [WeSpeaker ResNet34](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM) turns up to 3 s of each person's solo speech into a voiceprint. Voiceprints are followed from one check to the next, so each person builds up evidence over the conversation and a voice change under the same label is caught.
 3. **Decide:** each person is compared with the blocked and allowed voices. Audio that hasn't played yet is covered where a blocked person talks.
 4. **Separate overlaps:** where a blocked person talks over someone, [Conv-TasNet](https://huggingface.co/JorisCos/ConvTasNet_Libri2Mix_sepclean_16k) splits the audio into two voices, and the one that isn't them is played instead. If the split isn't clear, the overlap is turned down.
+
+5. **Sound:** [GTCRN](https://github.com/Xiaobin-Rong/gtcrn) (0.5 MB) splits the room into voice and background as it arrives. Covering a voice removes only the voice part and fills in with room tone recorded when no one was talking; noise reduction turns down the background part.
 
 Each stretch of audio is re-checked several times before it plays, and the latest, best-informed decision wins. [Silero VAD](https://github.com/snakers4/silero-vad) handles enrollment and the mic meter.
 
@@ -84,7 +89,7 @@ Requires JDK 17+ and the Android SDK (platform 36). Open the folder in Android S
 
 ## Credits and licenses
 
-- Silero VAD: MIT. pyannote segmentation-3.0: MIT.
+- Silero VAD: MIT. pyannote segmentation-3.0: MIT. GTCRN: MIT.
 - WeSpeaker ResNet34-LM: CC BY 4.0.
 - Conv-TasNet (Libri2Mix) by Joris Cosentino / Asteroid: CC BY-SA 4.0.
 - Test audio is from [LibriSpeech](https://www.openslr.org/12) (CC BY 4.0), taken from the [Resemblyzer](https://github.com/resemble-ai/Resemblyzer) repository's samples.

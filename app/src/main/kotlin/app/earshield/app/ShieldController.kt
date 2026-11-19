@@ -15,6 +15,7 @@ import app.earshield.core.LiveSpeaker
 import app.earshield.core.SpeakerSegmenter
 import app.earshield.core.Vectors
 import app.earshield.core.VoiceDiscovery
+import app.earshield.core.SpeechEnhancer
 import app.earshield.core.SpeechSeparator
 import app.earshield.core.WespeakerEncoder
 import app.earshield.core.SileroVad
@@ -142,7 +143,10 @@ class ShieldController(private val context: Context) : BlockingListener {
     }
 
     private fun AppSettings.toBlocking(paused: Boolean) =
-        BlockingSettings(delaySeconds, threshold, cover, overlap, blockingEnabled = !paused, blockStrangers = blockStrangers)
+        BlockingSettings(
+            delaySeconds, threshold, cover, overlap, blockingEnabled = !paused, blockStrangers = blockStrangers,
+            noiseReduction = noiseReduction, chatterReduction = chatterReduction, maskingNoise = maskingNoise,
+        )
 
     // --- Start / stop -----------------------------------------------------------------------
 
@@ -198,7 +202,11 @@ class ShieldController(private val context: Context) : BlockingListener {
         encoder = enc
         val seg = SpeakerSegmenter(bytes("speaker_segmentation.onnx")).also { segmenter = it }
         val sep = SpeechSeparator(bytes("speech_separator.onnx"), threads = 2).also { separator = it }
-        return BlockingPipeline(enc, seg, SileroVad(bytes("silero_vad.onnx")), listener = this, separator = sep)
+        val enhancerModel = bytes("speech_enhancer.onnx")
+        return BlockingPipeline(
+            enc, seg, SileroVad(bytes("silero_vad.onnx")), listener = this, separator = sep,
+            enhancerFactory = { SpeechEnhancer(enhancerModel) },
+        )
     }
 
     private fun startEngine(p: BlockingPipeline) {

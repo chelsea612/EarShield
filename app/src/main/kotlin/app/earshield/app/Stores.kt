@@ -23,6 +23,9 @@ data class AppSettings(
     val cover: CoverStyle = BlockingSettings().cover,
     val overlap: OverlapStyle = BlockingSettings().overlap,
     val blockStrangers: Boolean = false,
+    val noiseReduction: Float = 0.5f,
+    val chatterReduction: Float = 0f,
+    val maskingNoise: Float = 0f,
     val buzzOnBlock: Boolean = true,
 )
 
@@ -34,8 +37,13 @@ class SettingsStore(context: Context) {
     private fun load(): AppSettings {
         val d = AppSettings()
         // Version 0.3 changed what the delay and threshold mean; start those from the new defaults.
-        if (prefs.getInt("settingsVersion", 1) < SETTINGS_VERSION) {
-            prefs.edit().remove("delaySeconds").remove("threshold").putInt("settingsVersion", SETTINGS_VERSION).apply()
+        val version = prefs.getInt("settingsVersion", 1)
+        if (version < SETTINGS_VERSION) {
+            val e = prefs.edit()
+            // 0.3: delay and threshold meanings changed. 0.7: "Natural" covering became the default.
+            if (version < 2) e.remove("delaySeconds").remove("threshold")
+            if (version < 3) e.remove("cover")
+            e.putInt("settingsVersion", SETTINGS_VERSION).apply()
         }
         return AppSettings(
             inputMode = enumOr(prefs.getString("inputMode", null), d.inputMode),
@@ -44,6 +52,9 @@ class SettingsStore(context: Context) {
             cover = enumOr(prefs.getString("cover", null), d.cover),
             overlap = enumOr(prefs.getString("overlap", null), d.overlap),
             blockStrangers = prefs.getBoolean("blockStrangers", d.blockStrangers),
+            noiseReduction = prefs.getFloat("noiseReduction", d.noiseReduction),
+            chatterReduction = prefs.getFloat("chatterReduction", d.chatterReduction),
+            maskingNoise = prefs.getFloat("maskingNoise", d.maskingNoise),
             buzzOnBlock = prefs.getBoolean("buzzOnBlock", d.buzzOnBlock),
         )
     }
@@ -58,12 +69,15 @@ class SettingsStore(context: Context) {
             .putString("cover", s.cover.name)
             .putString("overlap", s.overlap.name)
             .putBoolean("blockStrangers", s.blockStrangers)
+            .putFloat("noiseReduction", s.noiseReduction)
+            .putFloat("chatterReduction", s.chatterReduction)
+            .putFloat("maskingNoise", s.maskingNoise)
             .putBoolean("buzzOnBlock", s.buzzOnBlock)
             .apply()
     }
 
     private companion object {
-        const val SETTINGS_VERSION = 2
+        const val SETTINGS_VERSION = 3
     }
 
     private inline fun <reified T : Enum<T>> enumOr(name: String?, default: T): T =
